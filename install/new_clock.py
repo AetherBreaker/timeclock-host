@@ -27,7 +27,8 @@ Every step checks what's already done, so a rerun after a failure carries on whe
    as the hostname, through timeclock-dev's GitHub App, watching docker/**, on the predefined network, Consistent
    Container Names on; its variables: the clock's own from the steps above, host updates on :stable in a 03:00 window,
    the shared ones copied from timeclock-dev's (not PINGKEY or the Pushover pair, which the owner sets by hand, then
-   deploys). A reinstalled clock: its application is kept as it is and deployed.
+   deploys). A reinstalled clock: its application is kept, its empty host update variables set as a new clock's, and
+   deployed.
 It ends by printing the clock's entry for the workstation's ~/.ssh/config, so `ssh <hostname>` goes through the tunnel.
 
 Needs: COOLIFY_API_TOKEN (a root token) in the environment or this repository's .env (gitignored); ~/.ssh/timeclock_dev
@@ -262,8 +263,18 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
   print("  remote access: RustDesk's package on the clock")
 
   if existing:
+    # A clock from before the host image has no host update settings: the production ones, where they're empty.
+    envs = {e["key"]: e for e in api("GET", f"/applications/{existing['uuid']}/envs") if not e["is_preview"]}  # pyright: ignore[reportGeneralTypeIssues]
+    unset = {k: v for k, v in HOST_UPDATES.items() if not (envs.get(k) or {}).get("value")}
+    if unset:
+      api(
+        "PATCH",
+        f"/applications/{existing['uuid']}/envs/bulk",
+        {"data": [{"key": k, "value": v, "is_preview": False} for k, v in unset.items()]},
+      )
+      print(f"  host updates: {', '.join(f'{k}={v}' for k, v in unset.items())}")
     api("POST", f"/deploy?uuid={existing['uuid']}")
-    print(f"done. Deploying {peer}'s application as it was.")
+    print(f"done. Deploying {peer}'s application.")
   else:
     # 6. Database login, with a new password (the application doesn't exist yet, so nothing else holds the old one).
     role = f"timeclock_clock_{name.replace('-', '_')}"
