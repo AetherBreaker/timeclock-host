@@ -1,0 +1,12 @@
+[Unit]
+Description=Docker's coolify network, which the clock app joins (Coolify creates it only along with its proxy)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'docker network inspect coolify >/dev/null 2>&1 || docker network create --attachable coolify'
+
+[Install]
+WantedBy=multi-user.target

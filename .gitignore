@@ -1,0 +1,6 @@
+# Per-clock secrets and backups (keys, wifi, data), install media, scratch
+private/
+out/
+work/
+# Plans stay out of git, as in timeclock-system
+PLAN-*.md

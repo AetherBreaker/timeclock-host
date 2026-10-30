@@ -1,0 +1,25 @@
+#!/bin/sh
+# timeclock-boot-entries.service (and the installer, right after it writes the first drive): a firmware boot entry for
+# each EFI partition on the internal drives, so either drive of the RAID1 pair boots alone, and none for partitions that
+# are gone. This HP boots neither a drive with no entry (it tries the network) nor past a dead one (its "boot option
+# restoration" loop). USB entries stay.
+set -eu
+ESP=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+esps=$(lsblk -nP -o PARTTYPE,PARTUUID,PKNAME,PARTN,RM | while read -r line; do
+  eval "$line"
+  [ "$RM" = 0 ] && [ "$(echo "$PARTTYPE" | tr A-F a-f)" = "$ESP" ] && echo "$(echo "$PARTUUID" | tr A-F a-f) /dev/${PKNAME##*/} $PARTN"
+done || true)
+[ -n "$esps" ] || { echo "boot-entries: no EFI partition on an internal drive"; exit 0; }
+efibootmgr -v | grep -v 'USB(' | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} .*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1 \2/p' |
+  while read -r num uuid; do
+    case "$esps" in *"$(echo "$uuid" | tr A-F a-f)"*) ;; *)
+      echo "boot-entries: deleting Boot$num (partition $uuid is gone)"
+      efibootmgr -q -b "$num" -B ;;
+    esac
+  done
+have=$(efibootmgr -v | tr A-F a-f)
+echo "$esps" | while read -r uuid disk partn; do
+  case "$have" in *"$uuid"*) continue ;; esac
+  echo "boot-entries: adding an entry for $disk partition $partn"
+  efibootmgr -q -c -d "$disk" -p "$partn" -L "Timeclock (${disk##*/})" -l '\EFI\fedora\shimx64.efi'
+done

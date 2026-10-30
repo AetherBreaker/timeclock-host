@@ -1,0 +1,12 @@
+#!/bin/sh
+# timeclock-grub-hidden.service: no GRUB menu (holding Esc during its 1 s shows it). bootupd's static grub.cfg shows the
+# menu for 1 s, then reads custom.cfg from /boot, which updates leave alone.
+set -eu
+CFG=/boot/grub2/custom.cfg
+want='set timeout_style=hidden
+set timeout=1'
+[ "$(cat "$CFG" 2>/dev/null)" != "$want" ] || exit 0
+mount -o remount,rw /boot
+printf '%s\n' "$want" >"$CFG"
+mount -o remount,ro /boot || true
+echo "grub-hidden: wrote $CFG"

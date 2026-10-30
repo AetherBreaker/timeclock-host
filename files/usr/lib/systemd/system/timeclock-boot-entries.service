@@ -1,0 +1,11 @@
+[Unit]
+Description=Firmware boot entries for each drive's EFI partition (either RAID1 drive boots alone)
+ConditionPathExists=/sys/firmware/efi
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/timeclock/boot-entries
+
+[Install]
+WantedBy=multi-user.target

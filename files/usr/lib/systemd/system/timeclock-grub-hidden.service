@@ -1,0 +1,11 @@
+[Unit]
+Description=Hide GRUB's menu (holding Esc during its second shows it)
+RequiresMountsFor=/boot
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/timeclock/grub-hidden
+
+[Install]
+WantedBy=multi-user.target

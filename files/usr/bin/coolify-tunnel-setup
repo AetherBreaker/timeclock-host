@@ -1,0 +1,52 @@
+#!/bin/sh
+# Connect this host to coolify-tunnel, so Coolify on the VPS can reach its SSH server (Decided 29):
+# this host dials the tunnel container and forwards PORT there to its own port 22.
+# Usage: sudo coolify-tunnel-setup [PORT] [VPS_HOST] [VPS_TUNNEL_PORT]
+set -eu
+PORT=${1:-22001}
+# A DNS-only name (not proxied through Cloudflare, which would block port 2223), so the VPS can move.
+VPS=${2:-tunnels.sweetfiretobacco.com}
+TUNNEL_PORT=${3:-2223}
+D=/etc/coolify-tunnel
+
+[ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
+install -d -m 700 "$D"
+[ -f "$D/key" ] || ssh-keygen -q -t ed25519 -N '' -C "$(hostname)-tunnel" -f "$D/key"
+
+ssh-keyscan -t ed25519 -p "$TUNNEL_PORT" "$VPS" > "$D/known_hosts.new" 2>/dev/null
+[ -s "$D/known_hosts.new" ] || { rm -f "$D/known_hosts.new"; echo "could not reach $VPS:$TUNNEL_PORT" >&2; exit 1; }
+# The production image ships the tunnel's key already trusted; asking is only for a key not seen before.
+if [ -f "$D/known_hosts" ] && [ "$(ssh-keygen -lf "$D/known_hosts.new")" = "$(ssh-keygen -lf "$D/known_hosts")" ]; then
+  rm -f "$D/known_hosts.new"
+else
+  echo "The tunnel's host key. Compare with the fingerprint in the coolify-tunnel container's log in Coolify:"
+  ssh-keygen -lf "$D/known_hosts.new"
+  printf 'Does it match? [y/N] '
+  read -r answer || answer=
+  [ "$answer" = y ] || { rm -f "$D/known_hosts.new"; echo "aborted" >&2; exit 1; }
+  mv "$D/known_hosts.new" "$D/known_hosts"
+fi
+
+cat > /etc/systemd/system/coolify-tunnel.service <<EOF
+[Unit]
+Description=Reverse SSH tunnel so Coolify on the VPS can reach this host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Through a shell: SELinux keeps systemd from starting ssh itself; a shell runs as an unconfined service, which may.
+ExecStart=/bin/sh -c "exec /usr/bin/ssh -N -p $TUNNEL_PORT -i $D/key -o UserKnownHostsFile=$D/known_hosts -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 0.0.0.0:$PORT:localhost:22 tunnel@$VPS"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now coolify-tunnel
+
+echo
+echo "Add this to docker/authorized_keys in coolify-tunnel (with a comment naming this device), commit, push and redeploy:"
+printf 'restrict,port-forwarding,permitlisten="0.0.0.0:%s" %s\n' "$PORT" "$(cat "$D/key.pub")"
+echo "Then add a server in Coolify at coolify-tunnel, port $PORT, user root."
+echo "The tunnel retries every 10 s until it's accepted: systemctl status coolify-tunnel"
