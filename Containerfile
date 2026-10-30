@@ -10,6 +10,8 @@ RUN git init -q /s && git -C /s fetch -q --depth 1 https://github.com/AetherBrea
   && cd /s/watcher && cargo build --release --locked --target x86_64-unknown-linux-musl
 
 FROM quay.io/fedora/fedora-coreos:stable
+# Links the published package to this repository (and the repository's Actions to it).
+LABEL org.opencontainers.image.source=https://github.com/AetherBreaker/timeclock-host
 
 # The browsers are timeclock-standby's kiosk.py on WebKitGTK: cog 0.18's Wayland output needs an EGL call Mesa 26
 # dropped (cog #738, #776). plymouth-plugin-label draws the splash's update message.

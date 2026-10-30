@@ -1,0 +1,32 @@
+name: "Promote: tag a host image build as :stable"
+run-name: "Promote ${{ inputs.ref }} to :stable"
+
+# Production clocks follow :stable: a build goes there by hand, once a clock on :latest has run it.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "The build: a release tag (v0.1.0) or a digest (sha256:...)"
+        required: true
+
+permissions:
+  packages: write
+
+jobs:
+  promote:
+    name: "Image: tag the build :stable (ubuntu-latest)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: docker/login-action ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: docker buildx imagetools create --tag :stable
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          case "$REF" in sha256:*) src="ghcr.io/aetherbreaker/timeclock-host@$REF" ;; *) src="ghcr.io/aetherbreaker/timeclock-host:$REF" ;; esac
+          docker buildx imagetools create --tag ghcr.io/aetherbreaker/timeclock-host:stable "$src"
