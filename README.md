@@ -30,6 +30,8 @@ outgrows `/boot`.
 
 ## Install a clock
 
-`install/make-iso.sh <clock>` builds an install stick from Fedora CoreOS's live ISO and `private/<clock>/` (the clock's
-name and number, drives, keys, wifi; see the script). The stick wipes the clock's two drives without asking, mirrors
-them (RAID1), and the first boot switches to this image.
+One install stick serves every clock: `TC_PASSWORD=... WIFI_SSID=... WIFI_PASSWORD=... install/make-iso.sh` builds
+`out/timeclock-install.iso` from Fedora CoreOS's live ISO. On the clock it asks the clock's name and number, erases the
+internal drives once confirmed, mirrors two of them (RAID1), and the first boot switches to `:stable`. Then
+`uv run install/new_clock.py <host>` enrols the clock in the tunnel, Coolify and the database. `install/test.sh` checks
+the stick in a VM with two drives. The whole procedure: timeclock-system's `docs/production-clock-setup.md`.

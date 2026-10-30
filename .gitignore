@@ -4,3 +4,4 @@ out/
 work/
 # Plans stay out of git, as in timeclock-system
 PLAN-*.md
+.env

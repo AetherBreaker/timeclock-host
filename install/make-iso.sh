@@ -1,86 +1,94 @@
 #!/bin/bash
-# Build a clock's install stick, out/<clock>.iso: Fedora CoreOS's live ISO, set to wipe the clock's two drives, install
-# onto them mirrored (RAID1: root, /boot, an EFI partition on each) with the clock's identity from private/<clock>/,
-# and move onto the timeclock-host image at first boot. Booting the stick installs at once, without asking: pull it out
-# when the clock reboots.
+# Build the clocks' install stick, out/timeclock-install.iso: Fedora CoreOS's live ISO with the clock installer
+# (install/installer.sh), which asks the clock's name and number on screen and installs onto its internal drives. One
+# stick for every clock. It holds tcadmin's password hash and the wifi network's password, so it stays in out/
+# (gitignored). Write it with Rufus (DD image mode) or balenaEtcher.
 #
-# Usage: install/make-iso.sh <clock>, after install/fetch-iso.sh. private/<clock>/ holds clock.conf (HOSTNAME, DISK1,
-# DISK2 as /dev/disk/by-id paths), etc/timeclock/clock.env, coolify.pub, tcadmin.pub and password.hash; optionally
-# etc/ssh/ssh_host_* and etc/coolify-tunnel/key* (a reinstalled clock keeps its SSH identity and tunnel), and
-# etc/NetworkManager/system-connections/*.nmconnection.
+# Usage: TC_PASSWORD=... [WIFI_SSID=... WIFI_PASSWORD=...] install/make-iso.sh
+#   TC_PASSWORD               tcadmin's console password (SSH takes the workstation's key only)
+#   WIFI_SSID, WIFI_PASSWORD  the wifi network every clock joins beside its cable (unset: none)
+#   CHANNEL                   the host image channel a new clock starts on: stable (default) or latest
+#   TCADMIN_KEY               tcadmin's SSH key (default ~/.ssh/timeclock_dev.pub)
+#   OUT, LIVE_KARGS           another output file and extra live kernel arguments (the VM test's answers)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-clock=$1
-dir=private/$clock
-# shellcheck source=/dev/null
-. "$dir/clock.conf"
-IMAGE=${IMAGE:-ghcr.io/aetherbreaker/timeclock-host:latest}
+: "${TC_PASSWORD:?TC_PASSWORD, the console password for tcadmin, is required}"
+CHANNEL=${CHANNEL:-stable}
+case "$CHANNEL" in stable | latest) ;; *) echo "make-iso: CHANNEL is stable or latest" >&2; exit 1 ;; esac
+TCADMIN_KEY=${TCADMIN_KEY:-$HOME/.ssh/timeclock_dev.pub}
+OUT=${OUT:-out/timeclock-install.iso}
+IMAGE=ghcr.io/aetherbreaker/timeclock-host:$CHANNEL
 W=$(pwd -W 2>/dev/null || pwd)
-# The firmware boot entries script: right after the install (--post-install), at first boot, and in the host image.
-sed 's/\r$//' files/usr/libexec/timeclock/boot-entries >"$dir/boot-entries"
+work=work/iso
+rm -rf "$work"
+mkdir -p "$work" out/iso
 
-files() { # path mode local-path, for each local file that exists
-  while [ $# -gt 0 ]; do
-    if [ -f "$dir/$3" ]; then
-      printf '    - path: %s\n      mode: %s\n      contents:\n        local: %s\n' "$1" "$2" "$3"
-    fi
-    shift 3
-  done
-}
+# Fedora CoreOS's current live ISO, checked against Fedora's signature by coreos-installer.
+MSYS_NO_PATHCONV=1 docker run --rm -v "$W:/r" quay.io/coreos/coreos-installer:release \
+  download -s stable -p metal -f iso -C /r/out/iso >/dev/null
+iso=$(cd out/iso && ls fedora-coreos-*-live-iso.x86_64.iso | sort -V | tail -n1)
 
-{
+sed 's/\r$//' install/coolify.pub >"$work/coolify.pub"
+sed 's/\r$//' "$TCADMIN_KEY" >"$work/tcadmin.pub"
+sed 's/\r$//' install/installer.sh >"$work/installer.sh"
+sed 's/\r$//' files/usr/libexec/timeclock/boot-entries >"$work/boot-entries"
+hash=$(printf %s "$TC_PASSWORD" | MSYS_NO_PATHCONV=1 docker run --rm -i --entrypoint openssl \
+  quay.io/fedora/fedora-coreos:stable passwd -6 -stdin)
+wifi=""
+if [ -n "${WIFI_SSID:-}" ]; then
+  : "${WIFI_PASSWORD:?WIFI_PASSWORD is required with WIFI_SSID}"
+  # A keyfile reads a backslash as an escape and ends a value at a newline. No interface or MAC: any wifi device joins.
+  case "$WIFI_SSID$WIFI_PASSWORD" in *\\* | *$'\n'*) echo "make-iso: no backslash or newline in the wifi settings" >&2; exit 1 ;; esac
+  # The profile's uuid from a Linux kernel: Git Bash on the workstation has neither /proc's nor uuidgen.
+  uuid=$(MSYS_NO_PATHCONV=1 docker run --rm --entrypoint cat quay.io/fedora/fedora-coreos:stable /proc/sys/kernel/random/uuid)
+  printf '[connection]\nid=%s\nuuid=%s\ntype=wifi\nautoconnect=true\n\n[wifi]\nmode=infrastructure\nssid=%s\n\n' \
+    "$WIFI_SSID" "$uuid" "$WIFI_SSID" >"$work/wifi.nmconnection"
+  printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n[ipv4]\nmethod=auto\n\n[ipv6]\naddr-gen-mode=default\nmethod=auto\n' \
+    "$WIFI_PASSWORD" >>"$work/wifi.nmconnection"
+  wifi="    - path: /etc/NetworkManager/system-connections/wifi.nmconnection
+      mode: 0600
+      contents:
+        local: wifi.nmconnection"
+fi
+
+# The clock's first-boot settings (Ignition), one per drive count. The installer fills in the name, number and drives.
+clock_config() {
+  printf 'variant: fcos\nversion: 1.6.0\n'
+  if [ "$1" = mirror ]; then
+    printf 'boot_device:\n  layout: x86_64\n  mirror:\n    devices:\n'
+    printf '      - /dev/disk/by-id/TIMECLOCK-DISK-1\n      - /dev/disk/by-id/TIMECLOCK-DISK-2\n'
+  fi
   cat <<EOF
-variant: fcos
-version: 1.6.0
-boot_device:
-  layout: x86_64
-  mirror:
-    devices:
-      - $DISK1
-      - $DISK2
 passwd:
   users:
+    # Coolify logs in as root by its key; tcadmin by the workstation's key, or at the console by password.
     - name: root
       ssh_authorized_keys_local: [coolify.pub]
     - name: tcadmin
-      password_hash: $(cat "$dir/password.hash")
+      password_hash: $hash
       ssh_authorized_keys_local: [tcadmin.pub]
       groups: [sudo, wheel, adm, systemd-journal]
 storage:
-  directories:
-    - path: /etc/coolify-tunnel
-      mode: 0700
   files:
     - path: /etc/hostname
       mode: 0644
       contents:
-        inline: $HOSTNAME
-EOF
-  files /etc/timeclock/clock.env 0600 etc/timeclock/clock.env \
-    /etc/ssh/ssh_host_ed25519_key 0600 etc/ssh/ssh_host_ed25519_key \
-    /etc/ssh/ssh_host_ed25519_key.pub 0644 etc/ssh/ssh_host_ed25519_key.pub \
-    /etc/ssh/ssh_host_ecdsa_key 0600 etc/ssh/ssh_host_ecdsa_key \
-    /etc/ssh/ssh_host_ecdsa_key.pub 0644 etc/ssh/ssh_host_ecdsa_key.pub \
-    /etc/ssh/ssh_host_rsa_key 0600 etc/ssh/ssh_host_rsa_key \
-    /etc/ssh/ssh_host_rsa_key.pub 0644 etc/ssh/ssh_host_rsa_key.pub \
-    /etc/coolify-tunnel/key 0600 etc/coolify-tunnel/key \
-    /etc/coolify-tunnel/key.pub 0644 etc/coolify-tunnel/key.pub \
-    /etc/coolify-tunnel/known_hosts 0644 etc/coolify-tunnel/known_hosts \
-    /etc/systemd/system/coolify-tunnel.service 0644 etc/systemd/system/coolify-tunnel.service
-  for nm in "$dir"/etc/NetworkManager/system-connections/*.nmconnection; do
-    [ -f "$nm" ] || continue
-    files "/etc/NetworkManager/system-connections/${nm##*/}" 0600 "etc/NetworkManager/system-connections/${nm##*/}"
-  done
-  files /etc/timeclock/boot-entries 0755 boot-entries
-  if [ -f "$dir/etc/systemd/system/coolify-tunnel.service" ]; then
-    printf '  links:\n    - path: /etc/systemd/system/multi-user.target.wants/coolify-tunnel.service\n'
-    printf '      target: /etc/systemd/system/coolify-tunnel.service\n'
-  fi
-  cat <<EOF
+        inline: timeclock-system-TIMECLOCKNAME
+    - path: /etc/timeclock/clock.env
+      mode: 0600
+      contents:
+        inline: |
+          INSTANCE_ID=TIMECLOCKNAME
+          CLOCK_NUMBER=TIMECLOCKNUMBER
+    - path: /etc/timeclock/boot-entries
+      mode: 0755
+      contents:
+        local: boot-entries
+$wifi
 systemd:
   units:
-    # Firmware boot entries for both drives' EFI partitions once the first boot has mirrored them (the installer's entry
-    # is for the first drive's partition before that). The host image runs its own copy from then on.
+    # Firmware boot entries for both drives' EFI partitions once the first boot has mirrored them (the installer's
+    # entry is for the first drive's, before that). The host image runs its own copy from then on.
     - name: timeclock-boot-entries-install.service
       enabled: true
       contents: |
@@ -114,30 +122,67 @@ systemd:
         [Install]
         WantedBy=multi-user.target
 EOF
-} >"$dir/config.bu"
-
-# Before the install, in the live system: stop and erase the drives' old RAID arrays and signatures, and drop firmware
-# boot entries for internal drives (an HP keeps trying to restore a dead one instead of booting). USB entries stay.
-cat >"$dir/pre-install.sh" <<EOF
-#!/bin/bash
-set -x
-for md in /dev/md/* /dev/md[0-9]*; do [ -b "\$md" ] && mdadm --stop "\$md"; done
-for d in $DISK1 $DISK2; do
-  for p in \$(lsblk -lnpo NAME "\$d" | tail -n +2); do mdadm --zero-superblock "\$p"; wipefs -af "\$p"; done
-  wipefs -af "\$d"
+}
+butane() {
+  MSYS_NO_PATHCONV=1 docker run --rm -i -v "$W/$work:/d" -w /d quay.io/coreos/butane:release --strict --files-dir /d
+}
+for variant in mirror single; do
+  clock_config "$variant" | butane >"$work/clock-$variant.ign"
+  grep -q TIMECLOCKNAME "$work/clock-$variant.ign" && grep -q TIMECLOCKNUMBER "$work/clock-$variant.ign" ||
+    { echo "make-iso: the clock's placeholders didn't survive Butane" >&2; exit 1; }
 done
-if command -v efibootmgr >/dev/null; then
-  efibootmgr -v | grep -v 'USB(' | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} .*HD([0-9]*,GPT,.*/\1/p' |
-    while read -r n; do efibootmgr -q -b "\$n" -B; done
-fi
-exit 0
+grep -q TIMECLOCK-DISK-2 "$work/clock-mirror.ign" || { echo "make-iso: the drive placeholders didn't survive" >&2; exit 1; }
+
+# The live system: the installer on terminal 1, with the clock's settings beside it.
+butane >"$work/live.ign" <<'EOF'
+variant: fcos
+version: 1.6.0
+storage:
+  files:
+    - path: /etc/timeclock-install/installer.sh
+      mode: 0755
+      contents:
+        local: installer.sh
+    - path: /etc/timeclock-install/boot-entries
+      mode: 0755
+      contents:
+        local: boot-entries
+    - path: /etc/timeclock-install/clock-mirror.ign
+      mode: 0600
+      contents:
+        local: clock-mirror.ign
+    - path: /etc/timeclock-install/clock-single.ign
+      mode: 0600
+      contents:
+        local: clock-single.ign
+systemd:
+  units:
+    - name: timeclock-install.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Timeclock install: asks the clock's name and number, installs onto its internal drives
+        After=systemd-user-sessions.service
+        Conflicts=getty@tty1.service
+
+        [Service]
+        Type=simple
+        ExecStart=/bin/bash /etc/timeclock-install/installer.sh
+        StandardInput=tty
+        StandardOutput=tty
+        StandardError=tty
+        TTYPath=/dev/tty1
+        TTYReset=yes
+        TTYVHangup=yes
+
+        [Install]
+        WantedBy=multi-user.target
 EOF
 
-MSYS_NO_PATHCONV=1 docker run --rm -v "$W/$dir:/d" -w /d quay.io/coreos/butane:release --strict --files-dir /d config.bu \
-  >"$dir/config.ign"
-iso=$(cd out/iso && ls fedora-coreos-*-live-iso.x86_64.iso | tail -n1)
-rm -f "out/$clock.iso"
-MSYS_NO_PATHCONV=1 docker run --rm -v "$W/$dir:/d" -v "$W/out:/out" quay.io/coreos/coreos-installer:release \
-  iso customize --dest-device "$DISK1" --dest-ignition /d/config.ign --pre-install /d/pre-install.sh \
-  --post-install /d/boot-entries -o "/out/$clock.iso" "/out/iso/$iso"
-echo "make-iso: out/$clock.iso (installs onto $DISK1 and $DISK2 mirrored, then switches to $IMAGE)"
+kargs=(--live-karg-append quiet --live-karg-append loglevel=3)
+for k in ${LIVE_KARGS:-}; do kargs+=(--live-karg-append "$k"); done
+rm -f "$OUT"
+MSYS_NO_PATHCONV=1 docker run --rm -v "$W:/r" quay.io/coreos/coreos-installer:release \
+  iso customize --live-ignition "/r/$work/live.ign" "${kargs[@]}" -o "/r/$OUT" "/r/out/iso/$iso"
+rm -rf "$work"
+echo "make-iso: $OUT (new clocks start on $IMAGE)"
