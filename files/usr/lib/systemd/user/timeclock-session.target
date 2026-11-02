@@ -1,0 +1,8 @@
+# Root's user session for the clock's display, started by sway (/etc/sway/config.d/60-timeclock-user-env.conf). sway
+# runs as a system service with no desktop session manager, so nothing else brings up graphical-session.target, and
+# the screen-sharing portal RustDesk uses won't start without it.
+[Unit]
+Description=The clock display's session: brings up graphical-session.target for the screen-sharing portal
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target

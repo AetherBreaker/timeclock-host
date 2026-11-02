@@ -15,14 +15,21 @@ LABEL org.opencontainers.image.source=https://github.com/AetherBreaker/timeclock
 
 # The browsers are timeclock-standby's kiosk.py on WebKitGTK: cog 0.18's Wayland output needs an EGL call Mesa 26
 # dropped (cog #738, #776). plymouth-plugin-label draws the splash's update message.
-RUN dnf -y --setopt=install_weak_deps=False install \
+# The screen-sharing portal is pinned at 0.7.1 (Fedora 43's build), from before its ext-image-copy-capture path: 0.8
+# exits mid-stream when RustDesk restarts its capture (xdg-desktop-portal-wlr #404; the fix, #405, isn't in 0.8.5).
+# Back to Fedora's package once a release has it.
+ARG XDPW_RPM=https://kojipkgs.fedoraproject.org/packages/xdg-desktop-portal-wlr/0.7.1/4.fc43/x86_64/xdg-desktop-portal-wlr-0.7.1-4.fc43.x86_64.rpm
+RUN curl -fsSL -o /tmp/xdpw.rpm "$XDPW_RPM" \
+  && echo "5c3ba69e745c67e764fb5f8b6a204d064b9f153dfd4dc033c9d351568c2b43a3  /tmp/xdpw.rpm" | sha256sum -c - \
+  && dnf -y --setopt=install_weak_deps=False install \
     sway sway-config-upstream swaybg mesa-dri-drivers webkitgtk6.0 gtk4 python3-gobject gobject-introspection python3-cairo \
-    xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber pipewire-gstreamer \
+    xdg-desktop-portal /tmp/xdpw.rpm pipewire wireplumber pipewire-gstreamer \
     plymouth plymouth-plugin-two-step plymouth-plugin-label plymouth-theme-spinner librsvg2-tools python3 perl-interpreter \
     dpkg avahi NetworkManager-wifi NetworkManager-config-connectivity-fedora wpa_supplicant \
     realtek-firmware iwlwifi-mvm-firmware iwlwifi-dvm-firmware mt7xxx-firmware atheros-firmware \
     docker-compose gtk3 libxdo libXfixes alsa-lib libva gstreamer1-plugins-base dejavu-sans-fonts \
-  && dnf clean all
+  && rpm -q xdg-desktop-portal-wlr | grep -q '^xdg-desktop-portal-wlr-0\.7\.1-' \
+  && rm /tmp/xdpw.rpm && dnf clean all
 
 # /opt and /usr/local are links into /var on this base, which updates never touch: the display's files go to
 # /usr/libexec/timeclock-standby (labelled as programs, so SELinux runs its scripts as an unconfined service) and the
