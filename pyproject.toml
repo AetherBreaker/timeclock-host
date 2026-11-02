@@ -1,0 +1,238 @@
+[project]
+  name            = "timeclock-host"
+  # The host image's version: `poe release` bumps it and tags vX.Y.Z, and the publish workflow stamps that tag into
+  # the image it builds.
+  version         = "0.1.0"
+  description     = "The timeclock clocks' host operating system: a bootc image on Fedora CoreOS, and its install tooling"
+  requires-python = ">=3.14"
+  dependencies    = []
+
+[dependency-groups]
+  dev = ["aeth-devkit>=15.1.1", "devkit-claude-hooks>=1.0.1", "devkit-poe-complete>=1.1.0", "devkit-templates>=1.3.2", "poethepoet>=0.46.0", "pyright>=1.1.411", "pytest>=8.0", "pytest-asyncio>=0.24", "pytest-cov>=5.0", "ruff>=0.15", "tombi>=1.5"]  # setup-project added: "pyright>=1.1.411", "pytest>=8.0", "pytest-asyncio>=0.24", "pytest-cov>=5.0", "ruff>=0.15", "tombi>=1.5"
+
+[tool.coverage]
+  [tool.coverage.run]
+    data_file   = ".cache/.coverage"
+    source_pkgs = ["timeclock_host"]
+
+  [tool.coverage.report]
+    show_missing = true
+
+  [tool.coverage.html]
+    directory = ".cache/htmlcov"
+
+  [tool.coverage.xml]
+    output = ".cache/coverage.xml"
+
+  [tool.coverage.lcov]
+    output = ".cache/coverage.lcov"
+
+[tool.devkit]
+  # The release is the host image, built and pushed by .github/workflows/publish.yml on a vX.Y.Z tag; there's no
+  # wheel for devkit's release workflow to build, so `poe release` below is this repository's own.
+  release-workflow = false
+
+[tool.poe]
+  include_script = [{ script = "aeth_devkit:tasks", executor = { type = "uv", frozen = true } }]
+
+  # Replaces devkit's `release` (a project's own task takes precedence over an included one).
+  [tool.poe.tasks.release]
+    help = """\
+      Bump the version, commit, tag vX.Y.Z, push, create the GitHub release, then wait for the publish workflow to \
+      build and push the host image. Bump types as positionals (major, minor, patch, stable, alpha, beta, rc, post, \
+      dev; none publishes the current version); a multi-word final argument is the release notes. --force / -f skips \
+      the confirmation, --dry-run only prints the plan. Examples: poe release patch | poe release minor 'first minor \
+      release'"""
+    cmd  = "python scripts/release.py $POE_EXTRA_ARGS"
+
+  # devkit's would release a wheel and pin a compose file; the host image has neither.
+  [tool.poe.tasks.release-and-pin]
+    help = "Not used here: the host image has no compose file to pin. Use poe release"
+    cmd  = '''python -c "import sys; sys.exit('timeclock-host has nothing to pin: use poe release')"'''
+
+[tool.pyright]
+  typeCheckingMode = "standard"
+
+  verboseOutput          = true
+  useLibraryCodeForTypes = true
+
+  enableReachabilityAnalysis  = true
+  analyzeUnannotatedFunctions = true
+  deprecateTypingAliases      = true
+
+  reportPropertyTypeMismatch          = true
+  reportMissingTypeStubs              = false
+  reportImportCycles                  = true
+  reportUntypedFunctionDecorator      = true
+  reportUntypedClassDecorator         = true
+  reportUntypedNamedTuple             = true
+  reportPrivateUsage                  = true
+  # reportConstantRedefinition          = true
+  reportDeprecated                    = true
+  # reportMissingSuperCall              = true
+  reportUninitializedInstanceVariable = true
+  reportMissingParameterType          = true
+  # reportMissingTypeArgument           = true
+  reportUnnecessaryIsInstance         = true
+  reportUnnecessaryCast               = true
+  reportUnnecessaryComparison         = true
+  reportUnnecessaryContains           = true
+  reportInvalidStubStatement          = true
+  reportUnnecessaryTypeIgnoreComment  = true
+  reportMatchNotExhaustive            = true
+  reportUnreachable                   = true
+  reportImplicitOverride              = true
+  reportMissingTypeArgument           = false
+
+  executionEnvironments = [{ root = "src", extraPaths = ["src"] }]
+
+[tool.pytest.ini_options]
+  addopts      = [
+    "--cov",
+    "--cov-report=term-missing",
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+  ]
+  cache_dir    = ".cache/pytest"
+  testpaths    = ["tests"]
+  xfail_strict = true
+  asyncio_mode = "auto"
+
+[tool.ruff]
+  cache-dir = ".cache/ruff"
+  # Sister projects' packages count as first-party (ruff `src` supports globs).
+  src       = ["./src", "../*/src", "../*/python"]
+
+  exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "dist",
+    "node_modules",
+    "venv",
+  ]
+
+  fix = true
+
+  indent-width = 2
+  line-length  = 135
+
+  [tool.ruff.format]
+    docstring-code-format = true
+
+  [tool.ruff.lint]
+    extend-select = [
+      "A",
+      "ANN001",
+      "ASYNC",
+      "B",
+      "C4",
+      "C90",
+      "D",
+      "DTZ",
+      "FBT003",
+      "LOG",
+      "N",
+      "NPY",
+      "PD",
+      "PERF",
+      "PL",
+      "PYI",
+      "RUF",
+      "T10",
+      "TC",
+      "TID",
+      "UP",
+    ]
+    ignore        = [
+      "A004",
+      "PD008",
+      "PD009",
+      "PLC0415",
+      "PLR0913",
+      "PLW0603",
+      "PIE790",
+    ]
+
+    [tool.ruff.lint.flake8-tidy-imports.banned-api]
+      # Delivered by ruff exactly when violated, so the reasoning costs no context otherwise.
+      "__future__.annotations".msg = "Python 3.14 evaluates all annotations lazily (PEP 649) with or without this import. What it adds is PEP 563 stringification, which breaks pydantic, dataclasses.fields() introspection, and typing.get_type_hints."
+
+    [tool.ruff.lint.pydocstyle]
+      convention = "google"
+
+    [tool.ruff.lint.per-file-ignores]
+      # No missing-docstring rules in tests: a test's name is its summary, and test docstrings
+      # read to agents as statements of intent that were never reviewed. D2xx+ still apply to
+      # docstrings a test does have.
+      "tests/**" = ["D1"]
+
+    [tool.ruff.lint.isort]
+      combine-as-imports = true
+      known-first-party  = ["timeclock_host"]
+
+      [tool.ruff.lint.isort.import-heading]
+        first-party      = "First party imports"
+        future           = "Future imports"
+        local-folder     = "Local folder imports"
+        standard-library = "Standard library imports"
+        third-party      = "Third party imports"
+
+[tool.tombi]
+  toml-version = "v1.1.0"
+
+  [tool.tombi.files]
+    exclude = [
+      ".bzr",
+      ".direnv",
+      ".eggs",
+      ".git",
+      ".git-rewrite",
+      ".hg",
+      ".mypy_cache",
+      ".nox",
+      ".pants.d",
+      ".pytype",
+      ".ruff_cache",
+      ".svn",
+      ".tox",
+      ".venv",
+      "__pypackages__",
+      "_build",
+      "buck-out",
+      "dist",
+      "node_modules",
+      "venv",
+    ]
+
+  [tool.tombi.format.rules]
+    indent-sub-tables               = true
+    indent-table-key-value-pairs    = true
+    key-value-equals-sign-alignment = true
+    trailing-comment-alignment      = true
+
+[tool.uv.sources]
+  aeth-devkit         = [{ index = "SFTPyPI" }]
+  devkit-claude-hooks = [{ index = "SFTPyPI" }]
+  devkit-poe-complete = [{ index = "SFTPyPI" }]
+  devkit-templates    = [{ index = "SFTPyPI" }]
+
+[[tool.uv.index]]
+  name     = "SFTPyPI"
+  url      = "https://pypi.sweetfiretobacco.com/jacob.ogden/internal/+simple"
+  explicit = true

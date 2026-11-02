@@ -1,0 +1,18 @@
+{
+    "permissions": {
+        "allow": [
+            "Bash(uv run pytest *)",
+            "Bash(uv run ruff check *)",
+            "Bash(uv run pyright *)",
+            "Bash(uv sync *)",
+            "Bash(git diff *)",
+            "Bash(git status *)",
+            "Bash(git log *)",
+            "WebSearch"
+        ]
+    },
+    "enabledMcpjsonServers": [
+        "github",
+        "context7"
+    ]
+}

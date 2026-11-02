@@ -2,3 +2,5 @@ private/
 out/
 work/
 .git/
+.venv/
+.cache/
