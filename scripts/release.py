@@ -30,7 +30,9 @@ def run(*args: str, check: bool = True) -> str:
 
 def main() -> None:  # noqa: C901, PLR0912, PLR0915  # one release, step by step
   """Release the host image."""
-  bumps, words, force, dry_run = [], [], False, False
+  # devkit's rule: bump types count until the first other word; the rest are the notes, which poe hands over split at
+  # spaces (with the quotes it added around them), so they're joined back and unquoted. One bare word is a typo.
+  bumps, tail, force, dry_run = [], [], False, False
   for arg in sys.argv[1:]:
     if arg in {"--force", "-f"}:
       force = True
@@ -38,14 +40,14 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915  # one release, step by step
       dry_run = True
     elif arg.startswith("-"):
       sys.exit(f"unknown option {arg}")
-    elif arg in BUMPS:
+    elif arg in BUMPS and not tail:
       bumps.append(arg)
     else:
-      words.append(arg)
-  if len(words) > 1:
-    sys.exit(f"release notes go in one quoted argument; got {len(words)}: {words}")
-  notes = words[0].strip() if words else ""
-  if notes and " " not in notes:
+      tail.append(arg)
+  notes = " ".join(tail).strip()
+  if len(notes) > 1 and notes[0] == notes[-1] and notes[0] in "'\"":
+    notes = notes[1:-1].strip()
+  if len(tail) == 1 and " " not in notes:
     sys.exit(f"{notes!r} isn't a bump type ({', '.join(BUMPS)}); release notes need more than one word")
 
   # Pre-flight: a clean main, level with origin, and a version not yet released.
