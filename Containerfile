@@ -58,7 +58,7 @@ COPY files/ /
 # Build contexts from Windows arrive with every file executable: config files back to 644.
 RUN set -eu; \
   find /usr/lib/systemd/system/timeclock-* /usr/lib/systemd/system/docker.service.d /usr/lib/tmpfiles.d \
-    /usr/lib/bootc/kargs.d /usr/lib/sysctl.d /usr/lib/modprobe.d /usr/lib/NetworkManager/conf.d /etc/ssh/sshd_config.d \
+    /usr/lib/systemd/user/timeclock-* /usr/lib/bootc/kargs.d /usr/lib/sysctl.d /usr/lib/modprobe.d /usr/lib/NetworkManager/conf.d /etc/ssh/sshd_config.d \
     /etc/coolify-tunnel /etc/sway/config.d /usr/share/timeclock -type f -exec chmod 644 {} +; \
   chmod 700 /etc/coolify-tunnel; chmod 755 /usr/bin/coolify-tunnel-setup /usr/libexec/timeclock/*
 
