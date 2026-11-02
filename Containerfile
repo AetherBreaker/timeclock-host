@@ -80,10 +80,12 @@ RUN set -eu; logo=/usr/share/timeclock/branding/SFT-Logo-June-2022-color.svg; \
   ! comm -23 /tmp/before /tmp/after | grep -q .; rm /tmp/before /tmp/after
 
 # The host's version: the release tag, stamped by publish.yml (`poe release`); "dev" for a build by hand. bootc status
-# shows it, and /usr/lib/timeclock/host-release holds it with the build date, which tells weekly rebuilds apart.
+# shows it (the image's version label), and os-release carries it for the app, which reads the host's os-release
+# through a compose mount: IMAGE_ID, IMAGE_VERSION, and BUILD_ID, the build date, which tells weekly rebuilds apart.
 ARG HOST_VERSION=dev
 LABEL org.opencontainers.image.version=$HOST_VERSION
-RUN install -d /usr/lib/timeclock && printf 'VERSION=%s\nBUILT=%s\n' "$HOST_VERSION" "$(date -u +%F)" > /usr/lib/timeclock/host-release
+RUN set -eu; f=/usr/lib/os-release; sed -i '/^\(IMAGE_ID\|IMAGE_VERSION\|BUILD_ID\)=/d' "$f"; \
+  printf 'IMAGE_ID=timeclock-host\nIMAGE_VERSION=%s\nBUILD_ID=%s\n' "$HOST_VERSION" "$(date -u +%F)" >> "$f"
 
 # Coolify keeps its files in /data/coolify and the app's folder is /data/timeclock_system_files: /data is a link into
 # /var. RustDesk's client stays out of this public image (its custom.txt holds the password): remote.sh unpacks it from
