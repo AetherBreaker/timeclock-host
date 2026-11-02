@@ -6,8 +6,10 @@
 
 Run from this repository once the clock has restarted into the host image (the stick's install, then its first boot
 switching to the image: a few minutes with internet):
-  uv run install/new_clock.py <host>
-<host> is the clock on the LAN: timeclock-system-<name>.local, or its IP address.
+  uv run install/new_clock.py [--test] <host>
+<host> is the clock on the LAN: timeclock-system-<name>.local, or its IP address. --test makes it a test clock: its
+punches go to the timeclock_test database (that's what makes a clock a test clock), and it takes every host release at
+once; without it, a production clock.
 
 Every step checks what's already done, so a rerun after a failure carries on where it stopped, and a reinstalled clock
 (its Coolify application already there) goes through it too:
@@ -22,13 +24,14 @@ Every step checks what's already done, so a rerun after a failure carries on whe
    port, and an ssh rule in Coolify's container sends every *-tunnel name to coolify-tunnel, see its README), validated;
 5. remote access: RustDesk's package (private/sweetfiresupportdesk.deb, gitignored: it holds the password) in the
    clock's data folder, where the host unpacks it;
-6. a new clock only: its database login, timeclock_clock_<name> in timeclock_clocks, with a random password;
+6. a new clock only: its database login, timeclock_clock_<name> in timeclock_clocks (a test clock:
+   timeclock_clock_<name>_test in timeclock_test_clocks), with a random password;
 7. a new clock: the Coolify application (timeclock-system's docker/compose.yaml, beside timeclock-dev's), named exactly
    as the hostname, through timeclock-dev's GitHub App, watching docker/**, on the predefined network, Consistent
-   Container Names on; its variables: the clock's own from the steps above, host updates on :stable in a 03:00 window,
-   the shared ones copied from timeclock-dev's (not PINGKEY or the Pushover pair, which the owner sets by hand, then
-   deploys). A reinstalled clock: its application is kept, its empty host update variables set as a new clock's, and
-   deployed.
+   Container Names on; its variables: the clock's own from the steps above, host updates (:stable in a 03:00 window; a
+   test clock :latest at once), the shared ones copied from timeclock-dev's (not PINGKEY or the Pushover pair, which
+   the owner sets by hand, then deploys). A reinstalled clock: its application is kept (on the database it was on), its
+   empty host update variables set as a new clock's, and deployed.
 It ends by printing the clock's entry for the workstation's ~/.ssh/config, so `ssh <hostname>` goes through the tunnel.
 
 Needs: COOLIFY_API_TOKEN (a root token) in the environment or this repository's .env (gitignored); ~/.ssh/timeclock_dev
@@ -64,8 +67,14 @@ REMOTE_DEB = ROOT / "private/sweetfiresupportdesk.deb"
 COOLIFY = "https://coolify.sweetfiretobacco.com/api/v1"
 TEMPLATE_INSTANCE = "dev"  # timeclock-dev's application: where the new one goes, and the shared variables' source
 OWNER_ONLY = {"PINGKEY", "ALERTS_PUSHOVER_TOKEN", "ALERTS_PUSHOVER_USER_KEY"}  # never copied; the owner sets them
-# A production clock follows promoted releases, applied at night (owner, 2026-10-30); editable in Coolify.
-HOST_UPDATES = {"HOST_UPDATE_CHANNEL": "stable", "HOST_UPDATE_MODE": "window", "HOST_UPDATE_WINDOW": "03:00/60m"}
+# Per kind of clock (test or not): its database and login group (the database decides whether a clock is in production,
+# owner 2026-11-02), and its host updates, editable in Coolify. A production clock follows promoted releases applied at
+# night (owner, 2026-10-30); a test clock every release at once.
+DATABASES = {False: ("timeclock", "timeclock_clocks", ""), True: ("timeclock_test", "timeclock_test_clocks", "_test")}
+HOST_UPDATES = {
+  False: {"HOST_UPDATE_CHANNEL": "stable", "HOST_UPDATE_MODE": "window", "HOST_UPDATE_WINDOW": "03:00/60m"},
+  True: {"HOST_UPDATE_CHANNEL": "latest", "HOST_UPDATE_MODE": "immediate"},
+}
 LOG_SERVER, BACKEND = "central-log-server", "timeclock-backend"
 
 
@@ -137,9 +146,12 @@ def deploy_app_named(name: str) -> None:
 
 
 def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in order on purpose; the module says what it does
-  if len(sys.argv) != 2:  # noqa: PLR2004
+  test = "--test" in sys.argv[1:]
+  args = [a for a in sys.argv[1:] if a != "--test"]
+  if len(args) != 1:
     sys.exit(__doc__)
-  host = sys.argv[1]
+  host = args[0]
+  db_name, db_group, role_suffix = DATABASES[test]
   opts = ["-i", Path.home() / ".ssh/timeclock_dev", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
   opts += ["-o", "StrictHostKeyChecking=accept-new"]
   ssh = ["ssh", *opts, f"tcadmin@{host}"]
@@ -263,9 +275,13 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
   print("  remote access: RustDesk's package on the clock")
 
   if existing:
-    # A clock from before the host image has no host update settings: the production ones, where they're empty.
     envs = {e["key"]: e for e in api("GET", f"/applications/{existing['uuid']}/envs") if not e["is_preview"]}  # pyright: ignore[reportGeneralTypeIssues]
-    unset = {k: v for k, v in HOST_UPDATES.items() if not (envs.get(k) or {}).get("value")}
+    if (envs.get("TIMECLOCK_DB_NAME") or {}).get("value") != db_name:
+      sys.exit(
+        f"{peer}'s application isn't on {db_name}: move it (setup doc, Test clocks), or rerun {'without' if test else 'with'} --test"
+      )
+    # A clock from before the host image has no host update settings: its kind's, where they're empty.
+    unset = {k: v for k, v in HOST_UPDATES[test].items() if not (envs.get(k) or {}).get("value")}
     if unset:
       api(
         "PATCH",
@@ -277,12 +293,12 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
     print(f"done. Deploying {peer}'s application.")
   else:
     # 6. Database login, with a new password (the application doesn't exist yet, so nothing else holds the old one).
-    role = f"timeclock_clock_{name.replace('-', '_')}"
+    role = f"timeclock_clock_{name.replace('-', '_')}{role_suffix}"
     password = secrets.token_urlsafe(32)
     sql = (
       f"DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN "
       f"ALTER ROLE {role} LOGIN PASSWORD '{password}'; ELSE "
-      f"CREATE ROLE {role} LOGIN PASSWORD '{password}' IN ROLE timeclock_clocks; END IF; END $$;\n"
+      f"CREATE ROLE {role} LOGIN PASSWORD '{password}' IN ROLE {db_group}; END IF; END $$;\n"
     )
     run(
       "ssh",
@@ -328,10 +344,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
       "INSTANCE_ID": name,
       "CLOCK_NUMBER": number,
       "WG_PRIVATE_KEY": wg_private,
-      "TIMECLOCK_DB_NAME": "timeclock",
+      "TIMECLOCK_DB_NAME": db_name,
       "TIMECLOCK_DB_USER": role,
       "TIMECLOCK_DB_PASSWORD": password,
-      **HOST_UPDATES,
+      **HOST_UPDATES[test],
     }
     # The rest are the same for every clock (alerts, hub): copied from timeclock-dev's. The owner's own channels (PINGKEY,
     # Pushover) are set by hand.
