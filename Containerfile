@@ -79,6 +79,12 @@ RUN set -eu; logo=/usr/share/timeclock/branding/SFT-Logo-June-2022-color.svg; \
   echo "initramfs modules lost:"; comm -23 /tmp/before /tmp/after; echo "gained:"; comm -13 /tmp/before /tmp/after; \
   ! comm -23 /tmp/before /tmp/after | grep -q .; rm /tmp/before /tmp/after
 
+# The host's version: the release tag, stamped by publish.yml (`poe release`); "dev" for a build by hand. bootc status
+# shows it, and /usr/lib/timeclock/host-release holds it with the build date, which tells weekly rebuilds apart.
+ARG HOST_VERSION=dev
+LABEL org.opencontainers.image.version=$HOST_VERSION
+RUN install -d /usr/lib/timeclock && printf 'VERSION=%s\nBUILT=%s\n' "$HOST_VERSION" "$(date -u +%F)" > /usr/lib/timeclock/host-release
+
 # Coolify keeps its files in /data/coolify and the app's folder is /data/timeclock_system_files: /data is a link into
 # /var. RustDesk's client stays out of this public image (its custom.txt holds the password): remote.sh unpacks it from
 # the data folder into /var/lib/sweetfiresupportdesk, and these links give it its usual paths.

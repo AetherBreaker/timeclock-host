@@ -1,8 +1,9 @@
-name: "Publish: build the host image, push :latest and the release tag"
-run-name: "${{ github.event_name == 'schedule' && 'Weekly rebuild' || format('Publish {0}', github.ref_name) }}"
+name: "Publish: build the host image, push the release tag and :latest"
+run-name: "${{ github.ref_type == 'tag' && format('Publish {0}', github.ref_name) || 'Rebuild the newest release' }}"
 
-# A release (a v* tag pushed by hand) and the weekly rebuild that brings in Fedora's security fixes both publish
-# :latest, which only clocks following latest take; :stable moves only by promote.yml.
+# A release (`poe release` pushes its vX.Y.Z tag) builds that tag. The weekly rebuild, and a run by hand, rebuild the
+# newest release tag to bring in Fedora's security fixes. Both push :latest, which only clocks following latest take;
+# :stable moves only by promote.yml. The image carries the release's version (HOST_VERSION), and its build date.
 on:
   push:
     tags: ["v*"]
@@ -13,6 +14,10 @@ on:
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
   image:
@@ -25,6 +30,20 @@ jobs:
 
       - name: actions/checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: echo RELEASE=the pushed tag
+        if: github.ref_type == 'tag'
+        run: echo "RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+
+      - name: git checkout the newest release tag
+        if: github.ref_type != 'tag'
+        run: |
+          tag=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          [ -n "$tag" ] || { echo "::error::no release yet (poe release): nothing to rebuild"; exit 1; }
+          git checkout -q "$tag"
+          echo "RELEASE=$tag" >> "$GITHUB_ENV"
 
       - name: docker/login-action ghcr.io
         uses: docker/login-action@v3
@@ -33,10 +52,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: docker build -f Containerfile
-        run: docker build -t ghcr.io/aetherbreaker/timeclock-host:latest -f Containerfile .
+      - name: docker build -f Containerfile --build-arg HOST_VERSION
+        run: docker build --build-arg "HOST_VERSION=${RELEASE#v}" -t ghcr.io/aetherbreaker/timeclock-host:latest -f Containerfile .
 
-      - name: docker push :latest (and the release tag)
+      - name: docker push :latest (and the release tag, on a release)
         run: |
           docker push ghcr.io/aetherbreaker/timeclock-host:latest
           if [ "$GITHUB_REF_TYPE" = tag ]; then
