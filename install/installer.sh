@@ -78,7 +78,7 @@ coreos-installer install "${ids[0]}" --ignition-file /tmp/clock.ign
 
 echo
 echo "Installed. The clock restarts from its own drives in 15 seconds (the stick can stay in, or come out any time), sets"
-echo "itself up, and restarts once more into the timeclock system (a few minutes, with internet). Then run new_clock.py"
-echo "from the workstation."
+echo "itself up, saying what it's doing on screen, and restarts once more into the timeclock system (a few minutes, with"
+echo "internet). Then run new_clock.py from the workstation."
 sleep 15
 systemctl reboot

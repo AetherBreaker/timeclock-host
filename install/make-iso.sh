@@ -32,6 +32,7 @@ sed 's/\r$//' install/coolify.pub >"$work/coolify.pub"
 sed 's/\r$//' "$TCADMIN_KEY" >"$work/tcadmin.pub"
 sed 's/\r$//' install/installer.sh >"$work/installer.sh"
 sed 's/\r$//' files/usr/libexec/timeclock/boot-entries >"$work/boot-entries"
+sed 's/\r$//' install/switch-image.sh >"$work/switch-image"
 hash=$(printf %s "$TC_PASSWORD" | MSYS_NO_PATHCONV=1 docker run --rm -i --entrypoint openssl \
   quay.io/fedora/fedora-coreos:stable passwd -6 -stdin)
 wifi=""
@@ -84,6 +85,10 @@ storage:
       mode: 0755
       contents:
         local: boot-entries
+    - path: /etc/timeclock/switch-image
+      mode: 0755
+      contents:
+        local: switch-image
 $wifi
 systemd:
   units:
@@ -102,22 +107,21 @@ systemd:
 
         [Install]
         WantedBy=multi-user.target
+    # It waits for the internet itself, saying so on screen, and runs past the end of boot (exec, not oneshot) so the
+    # login prompt and its messages show instead of systemd's "a start job is running".
     - name: timeclock-switch-image.service
       enabled: true
       contents: |
         [Unit]
         Description=Move this new install onto the clock's host image, then reboot into it
         ConditionPathExists=!/var/lib/timeclock-switched
-        Wants=network-online.target
-        After=network-online.target
+        After=NetworkManager.service
 
         [Service]
-        Type=oneshot
-        ExecStart=/usr/bin/bootc switch $IMAGE
-        ExecStart=/usr/bin/touch /var/lib/timeclock-switched
-        ExecStart=/usr/bin/systemctl reboot
-        Restart=on-failure
-        RestartSec=30
+        Type=exec
+        ExecStart=/etc/timeclock/switch-image $IMAGE
+        StandardOutput=journal+console
+        SyslogIdentifier=timeclock-setup
 
         [Install]
         WantedBy=multi-user.target

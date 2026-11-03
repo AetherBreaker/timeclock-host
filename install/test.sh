@@ -2,7 +2,7 @@
 # The install stick's test, in a QEMU VM under UEFI with two blank drives and the stick a USB disk left in throughout,
 # as on a clock: the installer runs unattended (the name and number on the kernel command line), and over SSH the first
 # boot must show the clock's identity, both drives mirrored with the drive's own EFI files (not the stick's), and a
-# firmware boot entry for each; then the switch to the host image, its services, and a boot from the second drive alone. No KVM in Docker Desktop, so QEMU emulates the CPU: it takes an hour or more. Logs and disks in work/vm.
+# firmware boot entry for each; then the switch to the host image (logging its progress), its services, and a boot from the second drive alone. No KVM in Docker Desktop, so QEMU emulates the CPU: it takes an hour or more. Logs and disks in work/vm.
 #
 # Usage: TC_PASSWORD=... install/test.sh (CHANNEL, default latest: the release under test)
 set -euo pipefail
@@ -65,6 +65,9 @@ ssh_vm 'sudo bootc status --format=humanreadable | head -3; sudo efibootmgr | gr
     printf "%s=%s " $u "$(systemctl is-active $u)"; done; echo'
 ssh_vm 'test "$(sudo efibootmgr | grep -c "Timeclock (")" -ge 2' || { echo "FAIL: a boot entry per drive"; exit 1; }
 ssh_vm 'systemctl is-active -q timeclock-watcher docker' || { echo "FAIL: services"; exit 1; }
+ssh_vm 'sudo journalctl -t timeclock-setup -o cat --no-pager | grep -v "^Still working" | tail -n 5'
+ssh_vm 'sudo journalctl -t timeclock-setup -o cat | grep -q "^Done. Restarting"' ||
+  { echo "FAIL: the switch didn't log its progress"; exit 1; }
 
 echo "== the second drive alone ($(date +%T))"
 ssh_vm 'sudo systemctl poweroff' || true
