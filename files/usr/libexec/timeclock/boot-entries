@@ -10,16 +10,26 @@ esps=$(lsblk -nP -o PARTTYPE,PARTUUID,PKNAME,PARTN,RM | while read -r line; do
   [ "$RM" = 0 ] && [ "$(echo "$PARTTYPE" | tr A-F a-f)" = "$ESP" ] && echo "$(echo "$PARTUUID" | tr A-F a-f) /dev/${PKNAME##*/} $PARTN"
 done || true)
 [ -n "$esps" ] || { echo "boot-entries: no EFI partition on an internal drive"; exit 0; }
-efibootmgr -v | grep -v 'USB(' | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} .*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1 \2/p' |
-  while read -r num uuid; do
+# The one loader every partition holds: the mirrored ones the first boot makes (esp-1, esp-2) carry only EFI\BOOT, so an
+# entry for \EFI\fedora\shimx64.efi (the plain install has it) is skipped by this HP. Uppercase, as compared below.
+LOADER='\EFI\BOOT\BOOTX64.EFI'
+efibootmgr -v | grep -v 'USB(' | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} .*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1 \2 &/p' |
+  while read -r num uuid line; do
     case "$esps" in *"$(echo "$uuid" | tr A-F a-f)"*) ;; *)
       echo "boot-entries: deleting Boot$num (partition $uuid is gone)"
-      efibootmgr -q -b "$num" -B ;;
+      efibootmgr -q -b "$num" -B
+      continue ;;
+    esac
+    case "$line" in *"Timeclock ("*)
+      case "$(echo "$line" | tr '[:lower:]' '[:upper:]')" in *"$LOADER"*) ;; *)
+        echo "boot-entries: deleting Boot$num (it starts another file than $LOADER)"
+        efibootmgr -q -b "$num" -B ;;
+      esac ;;
     esac
   done
-have=$(efibootmgr -v | tr A-F a-f)
+have=$(efibootmgr -v | tr '[:lower:]' '[:upper:]')
 echo "$esps" | while read -r uuid disk partn; do
-  case "$have" in *"$uuid"*) continue ;; esac
+  echo "$have" | grep -F "$(echo "$uuid" | tr '[:lower:]' '[:upper:]')" | grep -qF "$LOADER" && continue
   echo "boot-entries: adding an entry for $disk partition $partn"
-  efibootmgr -q -c -d "$disk" -p "$partn" -L "Timeclock (${disk##*/})" -l '\EFI\fedora\shimx64.efi'
+  efibootmgr -q -c -d "$disk" -p "$partn" -L "Timeclock (${disk##*/})" -l "$LOADER"
 done
