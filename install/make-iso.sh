@@ -184,5 +184,10 @@ for k in ${LIVE_KARGS:-}; do kargs+=(--live-karg-append "$k"); done
 rm -f "$OUT"
 MSYS_NO_PATHCONV=1 docker run --rm -v "$W:/r" quay.io/coreos/coreos-installer:release \
   iso customize --live-ignition "/r/$work/live.ign" "${kargs[@]}" -o "/r/$OUT" "/r/out/iso/$iso"
+# GRUB starts the live system at once instead of a 5-second menu with one entry: the same length, patched in place, as
+# coreos-installer patches the kernel arguments in this file.
+off=$(grep -abo 'set timeout=5' "$OUT" | cut -d: -f1)
+[ "$(echo "$off" | wc -w)" = 1 ] || { echo "make-iso: GRUB's 'set timeout=5' not found exactly once" >&2; exit 1; }
+printf 0 | dd of="$OUT" bs=1 seek=$((off + 12)) conv=notrunc status=none
 rm -rf "$work"
 echo "make-iso: $OUT (new clocks start on $IMAGE)"
