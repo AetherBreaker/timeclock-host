@@ -16,6 +16,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+# The image's own /usr/lib tree, which lib/ above would hide (a file missing from git is missing from the image).
+!files/usr/lib/
 parts/
 sdist/
 var/
