@@ -36,7 +36,7 @@ It ends by printing the clock's entry for the workstation's ~/.ssh/config, so `s
 
 Needs: COOLIFY_API_TOKEN (a root token) in the environment or this repository's .env (gitignored); ~/.ssh/timeclock_dev
 (tcadmin's key); `ssh Coolify_Server`; the wireguard-hub checkout beside this one (read only) and the coolify-tunnel one
-with push access. A reinstalled clock has a new SSH host key: `ssh-keygen -R <host>` first.
+with push access. The clock's old SSH host keys on record are dropped first: an install makes new ones.
 """
 
 # Standard library imports
@@ -145,7 +145,7 @@ def deploy_app_named(name: str) -> None:
   print(f"  deploying {name} in Coolify")
 
 
-def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in order on purpose; the module says what it does
+def main() -> None:  # noqa: C901, D103, PLR0912, PLR0915 - one linear checklist, in order on purpose; the module says what it does
   test = "--test" in sys.argv[1:]
   args = [a for a in sys.argv[1:] if a != "--test"]
   if len(args) != 1:
@@ -155,6 +155,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
   opts = ["-i", Path.home() / ".ssh/timeclock_dev", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
   opts += ["-o", "StrictHostKeyChecking=accept-new"]
   ssh = ["ssh", *opts, f"tcadmin@{host}"]
+  # An install gives the clock new SSH host keys, which the old ones on record would refuse; this runs after one.
+  subprocess.run(["ssh-keygen", "-R", host], capture_output=True, check=False)
 
   # 0. The host image: the stick installs plain Fedora CoreOS, whose first boot switches to it.
   status = json.loads(run(*ssh, "sudo bootc status --json"))
@@ -171,6 +173,12 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
   print(f"clock {name!r}, number {number}, at {host}, on {booted['image']}")
   if run(*ssh, "hostname").strip() != peer:
     sys.exit(f"{host} isn't named {peer}")
+  # The tunnel route checks the host key under the clock's .local name (HostKeyAlias): record it there too, whatever
+  # name or address this run reached the clock by.
+  alias = f"{peer}.local"
+  if host != alias:
+    subprocess.run(["ssh-keygen", "-R", alias], capture_output=True, check=False)
+    run(*ssh[:-1], "-o", f"HostKeyAlias={alias}", ssh[-1], "true")
 
   apps = api("GET", "/applications")
   existing = next((a for a in apps if a["name"] == peer), None)  # pyright: ignore[reportGeneralTypeIssues]
@@ -359,8 +367,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915 - one linear checklist, in o
     )
     print(f"  application: {peer} created ({', '.join(values)})")
     print(f"done. In Coolify, set {peer}'s {', '.join(sorted(OWNER_ONLY))} if wanted, then deploy it.")
-  # The host key is checked under the name this run reached the clock by, which accept-new above recorded.
-  print(f"\nAdd to ~/.ssh/config, so `ssh {peer}` goes through the tunnel:\n\nHost {peer}\n  Port {port}\n  HostKeyAlias {host}")
+  print(f"\nAdd to ~/.ssh/config, so `ssh {peer}` goes through the tunnel:\n\nHost {peer}\n  Port {port}\n  HostKeyAlias {alias}")
 
 
 if __name__ == "__main__":
