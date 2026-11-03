@@ -1,8 +1,8 @@
 #!/bin/bash
-# The install stick's test, in a QEMU VM under UEFI with two blank drives: the installer runs unattended (the name and
-# number on the kernel command line), and over SSH the first boot must show the clock's identity, both drives mirrored
-# and a firmware boot entry for each; then the switch to the host image, its services, and a boot from the second drive
-# alone. No KVM in Docker Desktop, so QEMU emulates the CPU: it takes an hour or more. Logs and disks in work/vm.
+# The install stick's test, in a QEMU VM under UEFI with two blank drives and the stick a USB disk left in throughout,
+# as on a clock: the installer runs unattended (the name and number on the kernel command line), and over SSH the first
+# boot must show the clock's identity, both drives mirrored with the drive's own EFI files (not the stick's), and a
+# firmware boot entry for each; then the switch to the host image, its services, and a boot from the second drive alone. No KVM in Docker Desktop, so QEMU emulates the CPU: it takes an hour or more. Logs and disks in work/vm.
 #
 # Usage: TC_PASSWORD=... install/test.sh (CHANNEL, default latest: the release under test)
 set -euo pipefail
@@ -41,7 +41,8 @@ wait_ssh() { # until the VM answers and $1 holds, or $2 minutes
 }
 d1='-drive file=disk1.qcow2,if=none,id=d1 -device virtio-blk-pci,drive=d1,serial=TCDISK1'
 d2='-drive file=disk2.qcow2,if=none,id=d2 -device virtio-blk-pci,drive=d2,serial=TCDISK2'
-iso='-drive file=test.iso,media=cdrom,if=none,id=cd -device ide-cd,drive=cd'
+# A USB disk, not a CD: Linux sees a USB stick's EFI partition, as on a clock, and a CD's not.
+iso='-device qemu-xhci,id=xhci -drive file=test.iso,format=raw,if=none,id=stick -device usb-storage,bus=xhci.0,drive=stick'
 
 echo "== install and first boot ($(date +%T))"
 # shellcheck disable=SC2086 # several arguments each
@@ -51,6 +52,9 @@ ssh_vm 'hostname; sudo cat /etc/timeclock/clock.env; cat /proc/mdstat; sudo efib
 ssh_vm 'test "$(hostname)" = timeclock-system-vmtest && sudo grep -qx CLOCK_NUMBER=99 /etc/timeclock/clock.env' ||
   { echo "FAIL: identity"; exit 1; }
 ssh_vm 'test "$(grep -c "^md.*raid1" /proc/mdstat)" -ge 2' || { echo "FAIL: not mirrored"; exit 1; }
+ssh_vm 'sudo mkdir -p /run/esp; for p in esp-1 esp-2; do sudo mount -o ro /dev/disk/by-partlabel/$p /run/esp || exit 1
+  sudo test -f /run/esp/EFI/fedora/shimx64.efi; r=$?; sudo umount /run/esp; [ $r = 0 ] || exit 1; done' ||
+  { echo "FAIL: the mirrored EFI partitions don't hold the drive's EFI files (the stick's?)"; exit 1; }
 
 echo "== switch to the host image ($(date +%T))"
 wait_ssh "sudo bootc status --json | grep -q timeclock-host" 180

@@ -189,5 +189,11 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$W:/r" quay.io/coreos/coreos-installer:re
 off=$(grep -abo 'set timeout=5' "$OUT" | cut -d: -f1)
 [ "$(echo "$off" | wc -w)" = 1 ] || { echo "make-iso: GRUB's 'set timeout=5' not found exactly once" >&2; exit 1; }
 printf 0 | dd of="$OUT" bs=1 seek=$((off + 12)) conv=notrunc status=none
+# The stick's EFI partition is named EFI-SYSTEM, like a clock's own: the first boot copies the partition by that name
+# onto the mirrored ones (Fedora CoreOS's transposefs), and took the stick's when it was left in. Renamed in place, the
+# same length, in its boot sector and its root directory's volume label.
+offs=$(grep -abo 'EFI-SYSTEM' "$OUT" | cut -d: -f1)
+[ "$(echo "$offs" | wc -w)" = 2 ] || { echo "make-iso: the EFI partition's name not found exactly twice" >&2; exit 1; }
+for o in $offs; do printf TC-INSTALL | dd of="$OUT" bs=1 seek="$o" conv=notrunc status=none; done
 rm -rf "$work"
 echo "make-iso: $OUT (new clocks start on $IMAGE)"
