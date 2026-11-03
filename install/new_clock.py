@@ -27,7 +27,7 @@ Every step checks what's already done, so a rerun after a failure carries on whe
 6. a new clock only: its database login, timeclock_clock_<name> in timeclock_clocks (a test clock:
    timeclock_clock_<name>_test in timeclock_test_clocks), with a random password;
 7. a new clock: the Coolify application (timeclock-system's docker/compose.yaml, beside timeclock-dev's), named exactly
-   as the hostname, through timeclock-dev's GitHub App, watching docker/**, on the predefined network, Consistent
+   as the hostname, through timeclock-dev's GitHub App, watching docker/compose.yaml, on the predefined network, Consistent
    Container Names on; its variables: the clock's own from the steps above, host updates (:stable in a 03:00 window; a
    test clock :latest at once), the shared ones copied from timeclock-dev's (not PINGKEY or the Pushover pair, which
    the owner sets by hand, then deploys). A reinstalled clock: its application is kept (on the database it was on), its
@@ -343,7 +343,9 @@ def main() -> None:  # noqa: C901, D103, PLR0912, PLR0915 - one linear checklist
       "docker_compose_location": template["docker_compose_location"],  # pyright: ignore[reportOptionalSubscript]
       "base_directory": template["base_directory"],  # pyright: ignore[reportOptionalSubscript]
       "instant_deploy": False,
-      "watch_paths": "docker/**",
+      # Only a release deploys a clock (owner): release-and-pin moves this file's GIT_TAG, and a merge touching the
+      # rest of docker/ waits for the next release.
+      "watch_paths": "docker/compose.yaml",
       "connect_to_docker_network": True,
     }
     app_uuid = api("POST", "/applications/private-github-app", body)["uuid"]  # pyright: ignore[reportIndexIssue]
