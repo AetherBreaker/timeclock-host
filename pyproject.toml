@@ -52,6 +52,7 @@
 
 [tool.pyright]
   typeCheckingMode = "standard"
+  extraPaths       = ["install"]  # install/ scripts import new_clock, their sibling
 
   verboseOutput          = true
   useLibraryCodeForTypes = true
@@ -184,7 +185,7 @@
 
     [tool.ruff.lint.isort]
       combine-as-imports = true
-      known-first-party  = ["timeclock_host"]
+      known-first-party  = ["timeclock_host", "new_clock"]
 
       [tool.ruff.lint.isort.import-heading]
         first-party      = "First party imports"
