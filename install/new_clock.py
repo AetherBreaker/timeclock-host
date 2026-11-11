@@ -18,10 +18,11 @@ Every step checks what's already done, so a rerun after a failure carries on whe
 2. wireguard-hub, checked only: the clock is enrolled by hand beforehand (its key as timeclock-system-<name>.key in the
    hub checkout, gitignored; a peers.toml row; forwards to the log server and the database relay in rules.v4; a
    release-and-pin), and the pinned release has the row, with the key's public half, and both forwards;
-3. coolify-tunnel: the clock's tunnel on its port (the next free one for a new clock) and its line in
-   docker/authorized_keys, pushed and redeployed (a reinstalled clock's tunnel key is new);
+3. coolify-tunnel: the clock's tunnel on its port (the next free one for a new clock), its line in
+   docker/authorized_keys and its <hostname>-tunnel network alias in docker/compose.yaml, pushed and redeployed (a
+   reinstalled clock's tunnel key is new);
 4. Coolify: the server (<hostname>-tunnel:<port>, root, no proxy; Coolify allows one server per address whatever the
-   port, and an ssh rule in Coolify's container sends every *-tunnel name to coolify-tunnel, see its README), validated;
+   port, so each clock's name is its own alias of coolify-tunnel, see its README), validated;
 5. remote access: RustDesk's package (private/sweetfiresupportdesk.deb, gitignored: it holds the password) in the
    clock's data folder, where the host unpacks it;
 6. a new clock only: its database login, timeclock_clock_<name> in timeclock_clocks (a test clock:
@@ -229,13 +230,23 @@ def main() -> None:  # noqa: C901, D103, PLR0912, PLR0915 - one linear checklist
   port = mine[0] if mine else max([22001, *ports]) + 1
   out = run(*ssh, f"sudo coolify-tunnel-setup {port}")
   line = next(x for x in out.splitlines() if x.startswith("restrict,"))
+  changed = []
   if line not in keys:
     if mine:
       keys = keys.replace(ports[port], line)  # a reinstall: the clock's tunnel key is new
     else:
       keys = keys.rstrip("\n") + f"\n\n# {port}: {peer}, a timeclock-system clock (clock {number})\n{line}\n"
     keys_path.write_text(keys, encoding="utf-8")
-    git_commit_push(TUNNEL, ["docker/authorized_keys"], f"feat: register {peer} on port {port}")
+    changed.append("docker/authorized_keys")
+  compose_path = TUNNEL / "docker/compose.yaml"
+  compose = compose_path.read_text(encoding="utf-8")
+  if f"- {peer}-tunnel\n" not in compose:
+    compose_path.write_text(
+      compose.replace("        aliases:\n", f"        aliases:\n          - {peer}-tunnel\n", 1), encoding="utf-8"
+    )
+    changed.append("docker/compose.yaml")
+  if changed:
+    git_commit_push(TUNNEL, changed, f"feat: register {peer} on port {port}")
     deploy_app_named("coolify-tunnel")
   print(f"  tunnel: port {port}")
 
