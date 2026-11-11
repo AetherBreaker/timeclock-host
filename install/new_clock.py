@@ -19,8 +19,8 @@ Every step checks what's already done, so a rerun after a failure carries on whe
    hub checkout, gitignored; a peers.toml row; forwards to the log server and the database relay in rules.v4; a
    release-and-pin), and the pinned release has the row, with the key's public half, and both forwards;
 3. coolify-tunnel: the clock's tunnel on its port (the next free one for a new clock), its line in
-   docker/authorized_keys and its <hostname>-tunnel network alias in docker/compose.yaml, pushed and redeployed (a
-   reinstalled clock's tunnel key is new);
+   docker/authorized_keys (pushed) and its <hostname>-tunnel among the application's network aliases in Coolify, then
+   a redeploy (a reinstalled clock's tunnel key is new);
 4. Coolify: the server (<hostname>-tunnel:<port>, root, no proxy; Coolify allows one server per address whatever the
    port, so each clock's name is its own alias of coolify-tunnel, see its README), validated;
 5. remote access: RustDesk's package (private/sweetfiresupportdesk.deb, gitignored: it holds the password) in the
@@ -230,23 +230,22 @@ def main() -> None:  # noqa: C901, D103, PLR0912, PLR0915 - one linear checklist
   port = mine[0] if mine else max([22001, *ports]) + 1
   out = run(*ssh, f"sudo coolify-tunnel-setup {port}")
   line = next(x for x in out.splitlines() if x.startswith("restrict,"))
-  changed = []
+  redeploy = False
   if line not in keys:
     if mine:
       keys = keys.replace(ports[port], line)  # a reinstall: the clock's tunnel key is new
     else:
       keys = keys.rstrip("\n") + f"\n\n# {port}: {peer}, a timeclock-system clock (clock {number})\n{line}\n"
     keys_path.write_text(keys, encoding="utf-8")
-    changed.append("docker/authorized_keys")
-  compose_path = TUNNEL / "docker/compose.yaml"
-  compose = compose_path.read_text(encoding="utf-8")
-  if f"- {peer}-tunnel\n" not in compose:
-    compose_path.write_text(
-      compose.replace("        aliases:\n", f"        aliases:\n          - {peer}-tunnel\n", 1), encoding="utf-8"
-    )
-    changed.append("docker/compose.yaml")
-  if changed:
-    git_commit_push(TUNNEL, changed, f"feat: register {peer} on port {port}")
+    git_commit_push(TUNNEL, ["docker/authorized_keys"], f"feat: register {peer} on port {port}")
+    redeploy = True
+  # Coolify reaches the clock at <peer>-tunnel, one of coolify-tunnel's network aliases in Coolify (its README).
+  tunnel_uuid = next(a["uuid"] for a in api("GET", "/applications") if a["name"] == "coolify-tunnel")  # pyright: ignore[reportGeneralTypeIssues]
+  aliases = [a for a in (api("GET", f"/applications/{tunnel_uuid}")["custom_network_aliases"] or "").split(",") if a]  # pyright: ignore[reportIndexIssue]
+  if f"{peer}-tunnel" not in aliases:
+    api("PATCH", f"/applications/{tunnel_uuid}", {"custom_network_aliases": ",".join([*aliases, f"{peer}-tunnel"])})
+    redeploy = True
+  if redeploy:
     deploy_app_named("coolify-tunnel")
   print(f"  tunnel: port {port}")
 
