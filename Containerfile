@@ -9,6 +9,12 @@ RUN git init -q /s && git -C /s fetch -q --depth 1 https://github.com/AetherBrea
   && rustup target add x86_64-unknown-linux-musl \
   && cd /s/watcher && cargo build --release --locked --target x86_64-unknown-linux-musl
 
+# The host updater: its tests run in the build, so a release can't ship with them failing.
+FROM docker.io/library/rust:1 AS updater
+COPY updater /u
+RUN rustup target add x86_64-unknown-linux-musl && cd /u && cargo test --locked \
+  && cargo build --release --locked --target x86_64-unknown-linux-musl
+
 FROM quay.io/fedora/fedora-coreos:stable
 # Links the published package to this repository (and the repository's Actions to it).
 LABEL org.opencontainers.image.source=https://github.com/AetherBreaker/timeclock-host
@@ -35,6 +41,7 @@ RUN curl -fsSL -o /tmp/xdpw.rpm "$XDPW_RPM" \
 # /usr/libexec/timeclock-standby (labelled as programs, so SELinux runs its scripts as an unconfined service) and the
 # watcher to /usr/bin, where timeclock-standby's units expect them.
 COPY --from=standby /s/watcher/target/x86_64-unknown-linux-musl/release/timeclock-watcher /usr/bin/timeclock-watcher
+COPY --from=updater /u/target/x86_64-unknown-linux-musl/release/timeclock-updater /usr/bin/timeclock-updater
 COPY --from=standby /s /tmp/standby
 RUN set -eu; cd /tmp/standby; S=/usr/libexec/timeclock-standby; install -d "$S"; \
   install -m 644 status/status.py status/standby.html status/standby.css status/fallback.html display/clock-start.html \
@@ -59,7 +66,7 @@ COPY files/ /
 RUN set -eu; \
   find /usr/lib/systemd/system/timeclock-* /usr/lib/systemd/system/docker.service.d /usr/lib/tmpfiles.d \
     /usr/lib/systemd/user/timeclock-* /usr/lib/bootc/kargs.d /usr/lib/sysctl.d /usr/lib/modprobe.d /usr/lib/NetworkManager/conf.d /etc/ssh/sshd_config.d \
-    /etc/coolify-tunnel /etc/sway/config.d /usr/share/timeclock -type f -exec chmod 644 {} +; \
+    /etc/coolify-tunnel /etc/timeclock/updater.conf /etc/sway/config.d /usr/share/timeclock -type f -exec chmod 644 {} +; \
   chmod 700 /etc/coolify-tunnel; chmod 755 /usr/bin/coolify-tunnel-setup /usr/libexec/timeclock/*
 
 # The logo: the splash's image, sway's background (sway.conf) and the standby page's start page (fallback.html).
@@ -96,7 +103,7 @@ RUN set -eu; ln -s var/data /data; \
   ln -s /usr/share/sweetfiresupportdesk/sweetfiresupportdesk /usr/bin/sweetfiresupportdesk; \
   systemctl mask getty@tty1.service sleep.target suspend.target hibernate.target hybrid-sleep.target \
     zincati.service bootc-fetch-apply-updates.timer; \
-  systemctl enable docker.service avahi-daemon.service timeclock-watcher.service timeclock-status.service \
+  systemctl enable docker.service avahi-daemon.service timeclock-watcher.service timeclock-updater.service timeclock-status.service \
     timeclock-display.service timeclock-standby.service timeclock-clock.service timeclock-remote.service \
     timeclock-tty1.service timeclock-update-splash.service sweetfiresupportdesk.service timeclock-grub-hidden.service \
     timeclock-coolify-network.service timeclock-boot-entries.service; \

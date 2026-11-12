@@ -4,3 +4,4 @@ work/
 .git/
 .venv/
 .cache/
+updater/target/
