@@ -17,6 +17,8 @@ pub struct Config {
   pub update_check_every: Duration,
   pub update_idle: Duration,
   pub update_health_wait: Duration,
+  /// The app's status folder (created by the app): the updater leaves `host-update.json` there for the clock to show.
+  pub status_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -31,6 +33,7 @@ impl Default for Config {
       update_check_every: Duration::from_secs(60),
       update_idle: Duration::from_secs(60),
       update_health_wait: Duration::from_secs(600),
+      status_dir: "/data/timeclock_system_files/status".into(),
     }
   }
 }
@@ -60,6 +63,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
       "docker_socket" => c.docker_socket = value.into(),
       "host_image" => c.host_image = value.into(),
       "app_service" => c.app_service = value.into(),
+      "status_dir" => c.status_dir = value.into(),
       "update_check_secs" => c.update_check_every = Duration::from_secs(secs()?.max(10)),
       "update_idle_secs" => c.update_idle = Duration::from_secs(secs()?),
       "update_health_secs" => c.update_health_wait = Duration::from_secs(secs()?),
@@ -88,6 +92,7 @@ mod tests {
     assert_eq!(c.clock_app_id, "local.timeclock.Clock");
     assert_eq!(c.docker_socket, PathBuf::from("/var/run/docker.sock"));
     assert_eq!(c.helper_image, "coollabsio/coolify-helper");
+    assert_eq!(c.status_dir, PathBuf::from("/data/timeclock_system_files/status"));
   }
 
   #[test]
@@ -95,9 +100,10 @@ mod tests {
     let c = parse_config(
       "# comment\n\nhost_image = x/host:beta  # trailing\napp_service = app\nupdate_check_secs = 30\n\
        update_idle_secs = 5\nupdate_health_secs = 90\nsway_socket = /run/s.sock\nclock_app_id = x.Clock\n\
-       docker_socket = /run/docker.sock\nhelper_image = x/helper\n",
+       docker_socket = /run/docker.sock\nhelper_image = x/helper\nstatus_dir = /run/status\n",
     )
     .unwrap();
+    assert_eq!(c.status_dir, PathBuf::from("/run/status"));
     assert_eq!(c.host_image, "x/host:beta");
     assert_eq!(c.app_service, "app");
     assert_eq!(c.update_check_every, Duration::from_secs(30));

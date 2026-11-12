@@ -18,7 +18,11 @@ fn main() {
       eprintln!("{CONFIG}: {e}; using the defaults");
       Config::default()
     }),
-    Err(_) => Config::default(),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+    Err(e) => {
+      eprintln!("{CONFIG}: {e}; using the defaults");
+      Config::default()
+    }
   };
   eprintln!("updating: {cfg:?}");
   let start = Instant::now();
