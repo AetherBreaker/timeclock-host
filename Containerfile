@@ -6,7 +6,7 @@
 # The screen watcher and the standby screen's files: timeclock-standby at an exact commit, so a build is reproducible
 # and the cache follows the commit, not a branch name.
 FROM docker.io/library/rust:1 AS standby
-ARG STANDBY_REF=65ce19d4aebefc4bf9e0f820fc4201f80c943af5
+ARG STANDBY_REF=2d6e05ee3b962ca4134270b2a96f0e006e5cf851
 RUN git init -q /s && git -C /s fetch -q --depth 1 https://github.com/AetherBreaker/timeclock-standby.git "$STANDBY_REF" \
   && git -C /s checkout -q FETCH_HEAD \
   && rustup target add x86_64-unknown-linux-musl \
