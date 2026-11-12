@@ -1,0 +1,28 @@
+# RustDesk (the owner's client, Sweet Fire Support Desk), unpacked from the data folder by timeclock-remote.service. Its
+# package's own unit, plus the host's drop-in: it picks the screen's session once, at start, so it starts once
+# sway answers (up to a minute, then anyway) and restarts with the display; its screen process needs the session's
+# Wayland socket and bus for the screen-sharing portal.
+[Unit]
+Description=Sweet Fire Support Desk (RustDesk)
+Requires=network.target
+After=systemd-user-sessions.service timeclock-remote.service timeclock-display.service
+PartOf=timeclock-display.service
+ConditionPathExists=/usr/bin/sweetfiresupportdesk
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/0 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=sway
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+Environment="PULSE_LATENCY_MSEC=60" "PIPEWIRE_LATENCY=1024/48000"
+ExecStartPre=-/bin/sh -c 'i=0; until swaymsg -s /run/timeclock-display/sway.sock -t get_version >/dev/null 2>&1 || [ "$i" -ge 120 ]; do sleep 0.5; i=$((i + 1)); done'
+ExecStart=/bin/sh -c 'for s in /run/user/0/wayland-*; do [ -S "$s" ] && export WAYLAND_DISPLAY="$${s##*/}"; done; exec /usr/bin/sweetfiresupportdesk --service'
+# Its --tray and --server processes too.
+ExecStop=/usr/bin/pkill -f "sweetfiresupportdesk --"
+PIDFile=/run/sweetfiresupportdesk.pid
+KillMode=mixed
+TimeoutStopSec=30
+User=root
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target

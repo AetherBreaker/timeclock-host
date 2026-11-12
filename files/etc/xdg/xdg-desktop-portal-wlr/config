@@ -1,0 +1,3 @@
+# /etc/xdg/xdg-desktop-portal-wlr/config: share the one screen without asking; nobody is at the clock to choose.
+[screencast]
+chooser_type=none

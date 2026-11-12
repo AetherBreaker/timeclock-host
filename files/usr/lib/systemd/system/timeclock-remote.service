@@ -1,0 +1,11 @@
+[Unit]
+Description=Timeclock remote access: RustDesk's package from the clock's folder, its settings kept there
+After=local-fs.target
+Before=sweetfiresupportdesk.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/timeclock/remote.sh
+
+[Install]
+WantedBy=multi-user.target

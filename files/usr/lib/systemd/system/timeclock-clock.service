@@ -1,0 +1,17 @@
+[Unit]
+Description=Timeclock clock browser: the kiosk on the clock app, shown by the watcher
+After=timeclock-display.service
+# Stops with sway and starts again with it.
+BindsTo=timeclock-display.service
+
+[Service]
+Type=simple
+# Only once sway answers: a browser started on its socket before that fails.
+ExecStartPre=/bin/sh -c 'until swaymsg -s /run/timeclock-display/sway.sock -t get_version >/dev/null 2>&1; do sleep 0.2; done'
+ExecStart=/usr/libexec/timeclock/clock.sh
+RuntimeDirectory=timeclock-clock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=timeclock-display.service

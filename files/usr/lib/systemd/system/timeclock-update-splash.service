@@ -1,0 +1,15 @@
+# The first boot into a host update (the updater's release still awaits its check): the boot splash says the update is
+# installing, as the reboot splash did, until the display takes over.
+[Unit]
+Description=Timeclock boot splash: say a system update is installing
+DefaultDependencies=no
+After=plymouth-start.service local-fs.target
+Before=timeclock-display.service
+ConditionPathExists=/var/lib/timeclock-updater/pending
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/plymouth change-mode --updates
+
+[Install]
+WantedBy=multi-user.target

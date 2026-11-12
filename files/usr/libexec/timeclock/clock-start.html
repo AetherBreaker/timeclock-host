@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Time clock</title>
+  <style>html, body { margin: 0; height: 100%; background: #000; }</style>
+</head>
+<body>
+  <!-- The clock browser's start page, from disk and hidden (sway's scratchpad): moves to the clock once the app answers,
+       so the kiosk's first load of the clock never fails while the app starts. clock.sh passes the clock's address. -->
+  <script>
+    const clock = new URLSearchParams(location.search).get("url") || "http://127.0.0.1:8080/?kiosk";
+    const favicon = new URL("/favicon.ico", clock).href;
+    // no-cors: any answer at all means the app serves.
+    const check = () => fetch(favicon, { mode: "no-cors", cache: "no-store" }).then(() => location.replace(clock), () => {});
+    check();
+    setInterval(check, 1000);
+  </script>
+</body>
+</html>

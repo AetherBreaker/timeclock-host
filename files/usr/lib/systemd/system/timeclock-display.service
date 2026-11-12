@@ -1,0 +1,33 @@
+[Unit]
+Description=Timeclock display: sway on terminal 7, showing the standby and the clock
+After=systemd-user-sessions.service plymouth-start.service timeclock-status.service
+# As display managers do: only display.sh quits the splash, once it has switched terminals. Debian's quit, run beside it,
+# put terminal 1 back in text mode and its boot messages showed for a moment (main-warehouse, 2026-10-29); it runs only
+# if the display fails.
+Conflicts=plymouth-quit.service
+After=plymouth-quit.service
+OnFailure=plymouth-quit.service
+Conflicts=getty@tty7.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/timeclock/display.sh
+User=root
+# A login session on terminal 7 (logind, through /etc/pam.d/timeclock-display): sway takes the screen through it, and
+# RustDesk finds the screen by it.
+PAMName=timeclock-display
+TTYPath=/dev/tty7
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty7
+UtmpMode=user
+Environment=XDG_SESSION_TYPE=wayland XDG_SESSION_DESKTOP=sway XDG_CURRENT_DESKTOP=sway
+# A fixed control socket for the watcher and the browsers' units.
+Environment=SWAYSOCK=/run/timeclock-display/sway.sock
+RuntimeDirectory=timeclock-display
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

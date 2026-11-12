@@ -1,13 +1,15 @@
 # timeclock-host
 
 The timeclock clocks' host operating system, as one bootc image: Fedora CoreOS with the clock's display (sway and the
-kiosk browser), the standby screen and screen watcher from
-[timeclock-standby](https://github.com/AetherBreaker/timeclock-standby), remote access, a quiet boot behind the logo
-splash, Docker for the clock app (deployed by Coolify), and the clock's network and tunnel settings.
+kiosk browser, in `files/`), the host updater (`updater/`), remote access, a quiet boot behind the logo splash, a console
+login timeout, Docker for the clock app (deployed by Coolify), and the clock's network and tunnel settings. The standby
+screen and screen watcher come from [timeclock-standby](https://github.com/AetherBreaker/timeclock-standby) at
+`STANDBY_REF`; they rely on this repo's sway socket, the clock window's app id, `timeclock-clock.service`,
+`timeclock-display.service` and `kiosk.py`.
 
 Published as `ghcr.io/aetherbreaker/timeclock-host`. Clocks follow a channel: `:latest` (every release) or `:stable`
-(releases promoted by hand). The watcher keeps the host on its channel, reading these variables of the clock's Coolify
-application:
+(releases promoted by hand). The updater (`timeclock-updater.service`, settings in `/etc/timeclock/updater.conf`; restart
+the unit after a change) keeps the host on its channel, reading these variables of the clock's Coolify application:
 
 | Variable | Values | Empty or unset |
 |---|---|---|
@@ -25,7 +27,7 @@ and never tries that release again.
 docker build -t ghcr.io/aetherbreaker/timeclock-host:latest -f Containerfile .
 ```
 
-`STANDBY_REF` (a timeclock-standby commit) picks the watcher and display files. The build fails if the early-boot image
+`STANDBY_REF` (a timeclock-standby commit) picks the watcher and the standby screen. The build fails if the early-boot image
 outgrows `/boot`.
 
 ## Install a clock

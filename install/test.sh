@@ -61,10 +61,10 @@ wait_ssh "sudo bootc status --json | grep -q timeclock-host" 180
 wait_ssh "sudo bootc status --format=humanreadable | grep -A1 Booted | grep -q timeclock-host" 30
 sleep 120
 ssh_vm 'sudo bootc status --format=humanreadable | head -3; sudo efibootmgr | grep -i timeclock; systemctl --failed --no-pager --plain
-  for u in timeclock-watcher timeclock-status timeclock-display docker coolify-tunnel timeclock-boot-entries; do
+  for u in timeclock-watcher timeclock-updater timeclock-status timeclock-display docker coolify-tunnel timeclock-boot-entries; do
     printf "%s=%s " $u "$(systemctl is-active $u)"; done; echo'
 ssh_vm 'test "$(sudo efibootmgr | grep -c "Timeclock (")" -ge 2' || { echo "FAIL: a boot entry per drive"; exit 1; }
-ssh_vm 'systemctl is-active -q timeclock-watcher docker' || { echo "FAIL: services"; exit 1; }
+ssh_vm 'systemctl is-active -q timeclock-watcher timeclock-updater docker' || { echo "FAIL: services"; exit 1; }
 ssh_vm 'sudo journalctl -t timeclock-setup -o cat --no-pager | grep -v "^Still working" | tail -n 5'
 ssh_vm 'sudo journalctl -t timeclock-setup -o cat | grep -q "^Done. Restarting"' ||
   { echo "FAIL: the switch didn't log its progress"; exit 1; }
