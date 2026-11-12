@@ -16,7 +16,7 @@ perl -e 'open(C, "<", "/dev/tty$ARGV[0]") or die "tty$ARGV[0]: $!"; ioctl(C, 0x4
   open(T, "<", "/dev/tty0") or die "tty0: $!"; ioctl(T, 0x5606, $ARGV[0] + 0) or die "VT_ACTIVATE: $!";
   ioctl(T, 0x5607, $ARGV[0] + 0) or die "VT_WAITACTIVE: $!"' "$OWN"
 # At boot the splash runs on terminal 1 and answers the switch above, so it quits only now (and only here: the unit
-# keeps Debian's own splash quit from running). It leaves terminal 1 in graphics mode with nothing answering switches,
+# keeps the distribution's own splash quit from running). It leaves terminal 1 in graphics mode with nothing answering switches,
 # where the kernel ignores every switch away from it: back to text mode (unseen from here), so later switches work.
 # Terminal 1 whatever showed before: someone may have switched to a console during the splash.
 if plymouth --ping 2>/dev/null; then

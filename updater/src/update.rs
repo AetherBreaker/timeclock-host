@@ -20,7 +20,7 @@ const SETTINGS: &str = "/var/lib/timeclock-updater/host-update";
 /// The release being applied: the next start checks the host came up on it.
 const PENDING: &str = "/var/lib/timeclock-updater/pending";
 /// Left in /run just before the reboot: the reboot splash then says a system update is installing (the plymouth-reboot
-/// drop-in, systemd/plymouth-reboot-update.conf).
+/// drop-in, files/usr/lib/systemd/system/plymouth-reboot.service.d/10-timeclock-update.conf).
 const UPDATING: &str = "/run/timeclock-host-updating";
 /// Releases that failed the check, never applied again; a newer one goes ahead.
 const BAD: &str = "/var/lib/timeclock-updater/bad-releases";
@@ -342,7 +342,8 @@ fn check_after_update(cfg: &Config, host: &Host) {
   }
 }
 
-/// The updater thread. `last_input`: milliseconds after `start` of the last keyboard or touch input (`u64::MAX`: none).
+/// The updater, run on the main thread. `last_input`: milliseconds after `start` of the last keyboard or touch input
+/// (`u64::MAX`: none).
 pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
   let _ = fs::create_dir_all(STATE);
   let mut settings = {

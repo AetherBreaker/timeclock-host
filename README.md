@@ -27,8 +27,8 @@ and never tries that release again.
 docker build -t ghcr.io/aetherbreaker/timeclock-host:latest -f Containerfile .
 ```
 
-`STANDBY_REF` (a timeclock-standby commit) picks the watcher and the standby screen. The build fails if the early-boot image
-outgrows `/boot`.
+`STANDBY_REF` (a timeclock-standby commit) picks the watcher and the standby screen. The build fails if the updater's tests fail or
+the early-boot image outgrows `/boot`.
 
 ## Install a clock
 
