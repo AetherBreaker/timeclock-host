@@ -133,6 +133,18 @@ pub struct Host {
   pub rollback_cached: Option<String>,
 }
 
+impl Host {
+  /// The newer release the last check found. A check records it on the newest downloaded release, and status shows
+  /// each release's own record: after a rollback the newest download is the bad release in the rollback slot, so its
+  /// record is the current one (the booted release's stays on the bad release for good).
+  pub fn cached_update(&self, bad: &[String]) -> Option<&str> {
+    match &self.rollback {
+      Some(r) if bad.contains(r) => self.rollback_cached.as_deref(),
+      _ => self.cached.as_deref(),
+    }
+  }
+}
+
 fn at<'a>(j: &'a Json, path: &[&str]) -> Option<&'a Json> {
   path.iter().try_fold(j, |j, k| j.get(k))
 }
@@ -224,15 +236,8 @@ pub fn next_step(
   if !checked {
     return Step::Check;
   }
-  // A check records what it finds on the newest downloaded release, and status shows each release's own record. After a
-  // rollback the newest download is the bad release in the rollback slot, so its record is the current one; the booted
-  // release's stays on the bad release for good.
-  let cached = match &host.rollback {
-    Some(r) if bad.contains(r) => &host.rollback_cached,
-    _ => &host.cached,
-  };
-  match cached {
-    Some(c) if *c != host.booted && !bad.contains(c) => Step::Stage { download_only: window },
+  match host.cached_update(bad) {
+    Some(c) if c != host.booted && !bad.iter().any(|b| b == c) => Step::Stage { download_only: window },
     _ => Step::Stay,
   }
 }
@@ -612,7 +617,7 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
         run_with_progress("bootc", &cfg, settings.mode, &args).map(drop)
       }
       Ok((Step::Stage { download_only }, host)) => {
-        eprintln!("host update: downloading {}", host.cached.as_deref().unwrap_or("?"));
+        eprintln!("host update: downloading {}", host.cached_update(&bad).unwrap_or("?"));
         let args: &[&str] = if download_only {
           &["upgrade", "--quiet", "--download-only"]
         } else {
@@ -802,6 +807,7 @@ mod tests {
       rollback_cached: Some("sha256:ccc".into()),
       ..host()
     };
+    assert_eq!(rolled_back.cached_update(&bad), Some("sha256:ccc"));
     assert_eq!(
       next_step(&rolled_back, &s, BASE, &bad, true, true, 600),
       Step::Stage { download_only: false }
