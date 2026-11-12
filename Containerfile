@@ -69,6 +69,7 @@ RUN cp /usr/share/plymouth/themes/spinner/*.png /usr/share/plymouth/themes/timec
 RUN set -eu; \
   find /usr/lib/systemd/system/timeclock-* /usr/lib/systemd/system/docker.service.d /usr/lib/tmpfiles.d \
     /usr/lib/systemd/user/timeclock-* /usr/lib/bootc/kargs.d /usr/lib/sysctl.d /usr/lib/modprobe.d /usr/lib/NetworkManager/conf.d /etc/ssh/sshd_config.d \
+    /etc/ssh/ssh_config.d/40-coolify-tunnel.conf \
     /etc/coolify-tunnel /etc/timeclock/updater.conf /etc/sway/config.d /usr/share/timeclock \
     /etc/pam.d/timeclock-display /etc/profile.d/timeclock-tmout.sh /etc/xdg/xdg-desktop-portal-wlr \
     /usr/lib/systemd/system/plymouth-reboot.service.d /usr/lib/systemd/system/sweetfiresupportdesk.service \
