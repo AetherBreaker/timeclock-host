@@ -7,12 +7,16 @@ use crate::config::Config;
 use crate::docker;
 use crate::sway::{self, Json, parse_json};
 use std::fs;
-use std::io::Write;
-use std::process::Command;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STATE: &str = "/var/lib/timeclock-updater";
 /// The last good settings, so a missing app container (mid-deploy, or before the first) changes nothing.
@@ -56,7 +60,7 @@ pub fn parse_window(text: &str) -> Option<(u16, u16)> {
   let (h, m) = at.split_once(':')?;
   let (h, m): (u16, u16) = (h.parse().ok()?, m.parse().ok()?);
   let len: u16 = len.strip_suffix('m')?.parse().ok()?;
-  (h < 24 && m < 60 && (1..=1440).contains(&len)).then_some((h * 60 + m, len))
+  (h < 24 && m < 60 && (1..=1440).contains(&len)).then(|| (h * 60 + m, len))
 }
 
 /// Settings from the container's `KEY=VALUE` variables. An empty or missing variable means no setting; an invalid one
@@ -239,6 +243,165 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
   }
 }
 
+/// The download's progress for the clock app, in the app's status folder.
+const PROGRESS_FILE: &str = "host-update.json";
+
+/// Bytes done and total of an image pull from one line of `bootc --progress-fd` output (JSON lines; format read from
+/// bootc 1.17.1, crates/lib/src/progress_jsonl.rs: `{"type":"ProgressBytes",...,"bytes":N,"bytesTotal":M,...}`). Other
+/// event types and unreadable lines are `None`.
+pub fn parse_progress(line: &str) -> Option<(u64, u64)> {
+  let j = parse_json(line)?;
+  if j.get("type") != Some(&Json::Str("ProgressBytes".into())) {
+    return None;
+  }
+  // `sway::Json` keeps no number values, so read them from the text. The task's own `bytes` precedes `subtasks`, whose
+  // entries carry the same keys, and `"bytes":` can't match `"bytesCached":`.
+  let num = |key: &str| {
+    let digits: String = line
+      .split_once(key)?
+      .1
+      .chars()
+      .take_while(char::is_ascii_digit)
+      .collect();
+    digits.parse::<u64>().ok()
+  };
+  Some((num(r#""bytes":"#)?, num(r#""bytesTotal":"#)?))
+}
+
+/// The contents of `host-update.json`; `at` is unix seconds.
+pub fn progress_json(downloaded: bool, done: u64, total: u64, mode: Mode, at: u64) -> String {
+  let state = if downloaded { "downloaded" } else { "downloading" };
+  let mode = match mode {
+    Mode::Immediate => r#""immediate","window_start":null"#.to_string(),
+    Mode::Window(start, _) => format!(r#""window","window_start":"{:02}:{:02}""#, start / 60, start % 60),
+  };
+  format!(r#"{{"state":"{state}","done":{done},"total":{total},"mode":{mode},"at":{at}}}"#)
+}
+
+/// Whether a bootc that doesn't know `--progress-fd` (clap's "unexpected argument") refused the command.
+pub fn refused_progress_fd(stderr: &str) -> bool {
+  stderr.contains("unexpected argument '--progress-fd'")
+}
+
+/// Replace `<status_dir>/host-update.json` atomically (temp file, rename), mode 0644. `Ok` and nothing written when
+/// the folder doesn't exist: no app to show it to.
+pub fn write_progress(status_dir: &Path, json: &str) -> io::Result<()> {
+  if !status_dir.is_dir() {
+    return Ok(());
+  }
+  let tmp = status_dir.join(".host-update.json.tmp");
+  let result = (|| {
+    let mut f = fs::OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .mode(0o644)
+      .open(&tmp)?;
+    f.write_all(json.as_bytes())?;
+    f.set_permissions(fs::Permissions::from_mode(0o644))?;
+    fs::rename(&tmp, status_dir.join(PROGRESS_FILE))
+  })();
+  if result.is_err() {
+    let _ = fs::remove_file(&tmp);
+  }
+  result
+}
+
+/// `bootc <args>` (`args[0]` is `upgrade` or `switch`) with `--progress-fd 3` on a pipe, keeping the progress file
+/// current while it runs: `downloading` at most once a second, `downloaded` once on success, removed on failure. A bootc
+/// too old for the flag is rerun without it.
+fn run_with_progress(cfg: &Config, mode: Mode, args: &[&str]) -> Result<String, String> {
+  let file = cfg.status_dir.join(PROGRESS_FILE);
+  let Some((sub, rest)) = args.split_first() else {
+    return run("bootc", args);
+  };
+  let mut fds = [0 as libc::c_int; 2];
+  // SAFETY: `fds` holds the two ints pipe2 fills in. O_CLOEXEC keeps both ends out of the child except the dup2'd 3.
+  if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    return run("bootc", args);
+  }
+  // SAFETY: pipe2 succeeded, so these are open fds nothing else owns; OwnedFd closes them on every path out.
+  let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+  let wfd = write_end.as_raw_fd();
+  let mut cmd = Command::new("bootc");
+  cmd
+    .arg(sub)
+    .args(["--progress-fd", "3"])
+    .args(rest)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+  // SAFETY: the closure runs between fork and exec and only calls async-signal-safe dup2/fcntl.
+  unsafe {
+    cmd.pre_exec(move || {
+      // dup2 clears close-on-exec on the copy; if the pipe already is fd 3 clear it by hand.
+      let ok = if wfd == 3 {
+        libc::fcntl(3, libc::F_SETFD, 0) != -1
+      } else {
+        libc::dup2(wfd, 3) != -1
+      };
+      if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
+    });
+  }
+  let mut child = cmd.spawn().map_err(|e| format!("bootc: {e}"))?;
+  drop(write_end);
+  let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    pipe.map(|mut p| {
+      thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = p.read_to_end(&mut buf);
+        buf
+      })
+    })
+  };
+  let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
+  let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
+  let now = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+  let mut last = (0, 0);
+  let mut written: Option<Instant> = None;
+  let mut lines = BufReader::new(fs::File::from(read_end));
+  let mut line = Vec::new();
+  loop {
+    line.clear();
+    if !matches!(lines.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+      break;
+    }
+    let Some((done, total)) = parse_progress(&String::from_utf8_lossy(&line)) else {
+      continue;
+    };
+    last = (done, total);
+    if total > 0 && written.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+      let _ = write_progress(&cfg.status_dir, &progress_json(false, done, total, mode, now()));
+      written = Some(Instant::now());
+    }
+  }
+  // After an read error bootc may still write: drain so it can't block.
+  let _ = io::copy(&mut lines, &mut io::sink());
+  let status = child.wait();
+  let join = |h: Option<thread::JoinHandle<Vec<u8>>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
+  let (stdout, stderr) = (join(out), join(err));
+  let (stdout, stderr) = (String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+  match status {
+    Ok(s) if s.success() => {
+      let _ = write_progress(&cfg.status_dir, &progress_json(true, last.1, last.1, mode, now()));
+      Ok(stdout.into_owned())
+    }
+    status => {
+      let _ = fs::remove_file(&file);
+      if status.is_ok() && refused_progress_fd(&stderr) {
+        return run("bootc", args);
+      }
+      let why = status.map_or_else(|e| e.to_string(), |s| s.to_string());
+      Err(format!(
+        "bootc {}: {why}: {}{}",
+        args.join(" "),
+        stdout.trim(),
+        stderr.trim()
+      ))
+    }
+  }
+}
+
 fn host_status() -> Result<Host, String> {
   let text = run("bootc", &["status", "--json"])?;
   parse_status(&text).ok_or_else(|| "bootc status: unreadable".to_string())
@@ -346,6 +509,7 @@ fn check_after_update(cfg: &Config, host: &Host) {
 /// (`u64::MAX`: none).
 pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
   let _ = fs::create_dir_all(STATE);
+  let _ = fs::remove_file(cfg.status_dir.join(PROGRESS_FILE));
   let mut settings = {
     let lines = read_lines(SETTINGS);
     settings_from_env(&lines, &Settings::default()).0
@@ -407,7 +571,7 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
           args.push("--download-only");
         }
         args.push(&image);
-        run("bootc", &args).map(drop)
+        run_with_progress(&cfg, settings.mode, &args).map(drop)
       }
       Ok((Step::Stage { download_only }, host)) => {
         eprintln!("host update: downloading {}", host.cached.as_deref().unwrap_or("?"));
@@ -416,11 +580,13 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
         } else {
           &["upgrade", "--quiet"]
         };
-        run("bootc", args).map(drop)
+        run_with_progress(&cfg, settings.mode, args).map(drop)
       }
       Ok((Step::Apply { from_downloaded }, host)) => {
         let digest = host.staged.map(|(d, _)| d).unwrap_or_default();
         eprintln!("host update: restarting into {digest}");
+        // Gone before the restart: a file left past the reboot would make the app say a restart is coming.
+        let _ = fs::remove_file(cfg.status_dir.join(PROGRESS_FILE));
         let _ = fs::write(PENDING, format!("{digest}\n"));
         let _ = fs::write(UPDATING, format!("{digest}\n"));
         if from_downloaded {
@@ -627,5 +793,61 @@ mod tests {
         download_only: false
       }
     );
+  }
+
+  const BYTES_LINE: &str = r#"{"type":"ProgressBytes","task":"pulling","description":"Pulling Image","id":"sha256:bbb","bytesCached":0,"bytes":312000000,"bytesTotal":740000000,"stepsCached":0,"steps":3,"stepsTotal":9,"subtasks":[{"subtask":"layer","description":"x","id":"l1","bytesCached":0,"bytes":5,"bytesTotal":6}]}"#;
+
+  #[test]
+  fn reads_bootc_progress_lines() {
+    assert_eq!(parse_progress(BYTES_LINE), Some((312_000_000, 740_000_000)));
+    let steps = r#"{"type":"ProgressSteps","task":"staging","description":"d","id":"i","stepsCached":0,"steps":1,"stepsTotal":3,"subtasks":[]}"#;
+    assert_eq!(parse_progress(steps), None);
+    assert_eq!(parse_progress(r#"{"type":"Start","version":"0.1.0"}"#), None);
+    assert_eq!(parse_progress("not json"), None);
+    assert_eq!(parse_progress(""), None);
+  }
+
+  #[test]
+  fn progress_file_text() {
+    assert_eq!(
+      progress_json(false, 312_000_000, 740_000_000, Mode::Window(180, 60), 1_762_905_600),
+      r#"{"state":"downloading","done":312000000,"total":740000000,"mode":"window","window_start":"03:00","at":1762905600}"#
+    );
+    assert_eq!(
+      progress_json(true, 5, 5, Mode::Immediate, 7),
+      r#"{"state":"downloaded","done":5,"total":5,"mode":"immediate","window_start":null,"at":7}"#
+    );
+  }
+
+  #[test]
+  fn spots_an_old_bootc_refusing_the_progress_flag() {
+    assert!(refused_progress_fd(
+      "error: unexpected argument '--progress-fd' found\n\nUsage: bootc upgrade"
+    ));
+    assert!(!refused_progress_fd("error: pulling image: registry unreachable"));
+  }
+
+  #[test]
+  fn writes_the_progress_file_only_where_there_is_a_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("tc-progress-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let dir = base.join("status");
+    assert!(write_progress(&dir, "{}").is_ok());
+    assert!(!dir.exists());
+    fs::create_dir_all(&dir).unwrap();
+    write_progress(&dir, "one").unwrap();
+    write_progress(&dir, "two").unwrap();
+    let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("host-update.json")]);
+    let file = dir.join("host-update.json");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+    assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644);
+    let _ = fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn a_window_hour_past_1092_is_no_window() {
+    assert_eq!(parse_window("1093:00/60m"), None);
   }
 }

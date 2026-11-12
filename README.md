@@ -21,6 +21,10 @@ An update is applied only when nobody has touched the screen for a minute and no
 says a system update is installing. If the new host's display, Docker or app isn't up within ten minutes, it rolls back
 and never tries that release again.
 
+While a release downloads, the updater keeps `host-update.json` in the app's status folder
+(`/data/timeclock_system_files/status`, setting `status_dir`), and the clock shows the download as a toast with a bar and
+when it installs. The file goes when the restart starts.
+
 ## Build
 
 ```sh
