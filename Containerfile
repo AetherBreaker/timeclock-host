@@ -30,7 +30,9 @@ LABEL org.opencontainers.image.source=https://github.com/AetherBreaker/timeclock
 # exits mid-stream when RustDesk restarts its capture (xdg-desktop-portal-wlr #404; the fix, #405, isn't in 0.8.5).
 # Back to Fedora's package once a release has it.
 ARG XDPW_RPM=https://kojipkgs.fedoraproject.org/packages/xdg-desktop-portal-wlr/0.7.1/4.fc43/x86_64/xdg-desktop-portal-wlr-0.7.1-4.fc43.x86_64.rpm
-RUN curl -fsSL -o /tmp/xdpw.rpm "$XDPW_RPM" \
+# The base policy's file-context types, for the guard before `bootc container lint` below.
+RUN grep -oE 'object_r:[a-z0-9_]+' /etc/selinux/targeted/contexts/files/file_contexts | sort -u > /tmp/fc-types.base \
+  && curl -fsSL -o /tmp/xdpw.rpm "$XDPW_RPM" \
   && echo "5c3ba69e745c67e764fb5f8b6a204d064b9f153dfd4dc033c9d351568c2b43a3  /tmp/xdpw.rpm" | sha256sum -c - \
   && dnf -y --setopt=install_weak_deps=False install \
     sway sway-config-upstream swaybg mesa-dri-drivers webkitgtk6.0 gtk4 python3-gobject gobject-introspection python3-cairo \
@@ -40,6 +42,9 @@ RUN curl -fsSL -o /tmp/xdpw.rpm "$XDPW_RPM" \
     realtek-firmware iwlwifi-mvm-firmware iwlwifi-dvm-firmware mt7xxx-firmware atheros-firmware \
     docker-compose smartmontools gtk3 libxdo libXfixes alsa-lib libva gstreamer1-plugins-base dejavu-sans-fonts \
   && rpm -q xdg-desktop-portal-wlr | grep -q '^xdg-desktop-portal-wlr-0\.7\.1-' \
+  # smartmontools-selinux (a rich dependency) adds a policy module with a new type, smartdwarn_script_t, that a host whose
+  # loaded policy lacks it can't import (fsetxattr EINVAL, so every `bootc upgrade` fails); the base's smartmon module covers smartd.
+  && rpm -e --nodeps smartmontools-selinux \
   && rm /tmp/xdpw.rpm && dnf clean all
 
 # /opt and /usr/local are links into /var on this base, which updates never touch: the display's files (files/) go to
@@ -111,4 +116,9 @@ RUN set -eu; ln -s var/data /data; \
     timeclock-coolify-network.service timeclock-boot-entries.service; \
   # smartmontools is here for smartctl only: smartd stays off (disabled, not masked, so it can be started by hand).
   systemctl disable smartd.service; \
+  # ostree labels an update's files with the new image's policy, and the running host's kernel rejects a type its loaded
+  # policy lacks: no file-context type may be new against the base.
+  grep -oE 'object_r:[a-z0-9_]+' /etc/selinux/targeted/contexts/files/file_contexts | sort -u > /tmp/fc-types.after; \
+  echo "file-context types gained:"; comm -13 /tmp/fc-types.base /tmp/fc-types.after; \
+  ! comm -13 /tmp/fc-types.base /tmp/fc-types.after | grep -q .; rm /tmp/fc-types.base /tmp/fc-types.after; \
   bootc container lint
