@@ -2,7 +2,7 @@
   name            = "timeclock-host"
   # The host image's version: `poe release` bumps it and tags vX.Y.Z, and the publish workflow stamps that tag into
   # the image it builds.
-  version         = "0.4.0"
+  version         = "0.4.1"
   description     = "The timeclock clocks' host operating system: a bootc image on Fedora CoreOS, and its install tooling"
   requires-python = ">=3.14"
   dependencies    = []
