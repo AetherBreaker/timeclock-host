@@ -1,0 +1,15 @@
+[Unit]
+Description=Blank terminals 1 and 7: no cursor, no text (the splash's at boot, and sway's while it restarts)
+Before=timeclock-display.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=TERM=linux
+TTYPath=/dev/tty1
+StandardOutput=tty
+ExecStart=/usr/bin/setterm --cursor off --clear all
+ExecStart=/bin/sh -c '/usr/bin/setterm --cursor off --clear all >/dev/tty7'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+#%PAM-1.0
+# /etc/pam.d/timeclock-display: the display's login session (timeclock-display.service's PAMName). No authentication:
+# systemd opens it for root; system-auth's pam_systemd registers it with logind.
+account   include   system-auth
+session   include   system-auth

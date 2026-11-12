@@ -1,0 +1,38 @@
+[Plymouth Theme]
+Name=Timeclock
+Description=Black with the clock's logo and the spinner theme, matching the standby page
+ModuleName=two-step
+
+[two-step]
+ImageDir=/usr/share/plymouth/themes/timeclock
+HorizontalAlignment=.5
+VerticalAlignment=.62
+WatermarkHorizontalAlignment=.5
+WatermarkVerticalAlignment=.5
+Transition=none
+TransitionDuration=0.0
+BackgroundStartColor=0x000000
+BackgroundEndColor=0x000000
+Font=DejaVu Sans 16
+TitleFont=DejaVu Sans Bold 28
+# The update text below the spinner; the default (.5) centres it over the logo. Its top sits at this fraction of the
+# height the text leaves free: about 520 px on a 768-line screen, under the spinner's 460-492.
+TitleHorizontalAlignment=.5
+TitleVerticalAlignment=.78
+
+[boot-up]
+UseEndAnimation=false
+
+[shutdown]
+UseEndAnimation=false
+
+[reboot]
+UseEndAnimation=false
+
+# A host update (the updater restarts the clock for one, and the first boot after): the same splash, saying so.
+# SubTitle holds two lines: a U+2028 line separator breaks them (the theme reader shows a backslash-n as is), and 11
+# spaces centre the second under the first, since the subtitle is left-aligned (widths measured in DejaVu Sans 16).
+[updates]
+UseEndAnimation=false
+Title=Installing a system update
+SubTitle=Do not touch or power down the device until complete            The clock will be back in a minute or two
