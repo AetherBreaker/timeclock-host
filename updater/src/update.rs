@@ -966,9 +966,13 @@ echo '{"steps":1,"stepsTotal":2,"type":"ProgressSteps"}' >&3"#;
   fn progress_runs_end_to_end_and_ends_downloaded() {
     let _guard = SCRIPTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // The snapshot is taken while the script still runs: the 100% line (within a second of the 5/9 write) must be there.
+    // The script waits up to 5 s for it rather than a fixed pause, which a loaded build machine outran.
     let (base, cfg) = fake_bootc(
       "ok",
-      &format!("{PULL}\nsleep 0.3\ncp \"$STATUS/host-update.json\" \"$STATUS/../snap\"\necho \"$@\"\necho warn >&2"),
+      &format!(
+        "{PULL}\nfor _ in $(seq 50); do grep -q '\"done\":9' \"$STATUS/host-update.json\" && break; sleep 0.1; done\n\
+         cp \"$STATUS/host-update.json\" \"$STATUS/../snap\"\necho \"$@\"\necho warn >&2"
+      ),
     );
     let program = base.join("bootc");
     let out = run_with_progress(
