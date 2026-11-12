@@ -1,5 +1,8 @@
 [Unit]
 Description=Timeclock host updater: keeps this host on its channel's newest release
+# Started before Docker, so it removes the last boot's host-update.json (kept through the restart for the clock's toast)
+# before the app could read it.
+Before=docker.service
 
 [Service]
 Type=simple

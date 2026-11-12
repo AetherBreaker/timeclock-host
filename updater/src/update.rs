@@ -546,6 +546,7 @@ fn check_after_update(cfg: &Config, host: &Host) {
 /// (`u64::MAX`: none).
 pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
   let _ = fs::create_dir_all(STATE);
+  // Last boot's file (kept through its restart): gone before the app can show it.
   let _ = fs::remove_file(cfg.status_dir.join(PROGRESS_FILE));
   let mut settings = {
     let lines = read_lines(SETTINGS);
@@ -628,8 +629,8 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
       Ok((Step::Apply { from_downloaded }, host)) => {
         let digest = host.staged.map(|(d, _)| d).unwrap_or_default();
         eprintln!("host update: restarting into {digest}");
-        // Gone before the restart: a file left past the reboot would make the app say a restart is coming.
-        let _ = fs::remove_file(cfg.status_dir.join(PROGRESS_FILE));
+        // The progress file stays, so the clock's toast does until the screen goes dark. The next boot's updater
+        // removes it as it starts, before Docker starts the app (the unit is ordered Before=docker.service).
         let _ = fs::write(PENDING, format!("{digest}\n"));
         let _ = fs::write(UPDATING, format!("{digest}\n"));
         if from_downloaded {

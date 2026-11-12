@@ -23,7 +23,8 @@ and never tries that release again.
 
 While a release downloads, the updater keeps `host-update.json` in the app's status folder
 (`/data/timeclock_system_files/status`, setting `status_dir`), and the clock shows the download as a toast with a bar and
-when it installs. The file goes when the restart starts.
+when it installs. The file stays through the restart, so the toast does too; the updater removes it as it starts on the
+next boot, before Docker starts the app.
 
 ## Build
 
