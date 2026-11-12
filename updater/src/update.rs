@@ -309,21 +309,22 @@ pub fn write_progress(status_dir: &Path, json: &str) -> io::Result<()> {
 
 /// `bootc <args>` (`args[0]` is `upgrade` or `switch`) with `--progress-fd 3` on a pipe, keeping the progress file
 /// current while it runs: `downloading` at most once a second, `downloaded` once on success, removed on failure. A bootc
-/// too old for the flag is rerun without it.
-fn run_with_progress(cfg: &Config, mode: Mode, args: &[&str]) -> Result<String, String> {
+/// too old for the flag is rerun without it. The state is rewritten at least every minute while bootc talks (the app
+/// drops a `downloading` file untouched for 5), and the final byte event is never throttled away.
+fn run_with_progress(program: &str, cfg: &Config, mode: Mode, args: &[&str]) -> Result<String, String> {
   let file = cfg.status_dir.join(PROGRESS_FILE);
   let Some((sub, rest)) = args.split_first() else {
-    return run("bootc", args);
+    return run(program, args);
   };
   let mut fds = [0 as libc::c_int; 2];
   // SAFETY: `fds` holds the two ints pipe2 fills in. O_CLOEXEC keeps both ends out of the child except the dup2'd 3.
   if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-    return run("bootc", args);
+    return run(program, args);
   }
   // SAFETY: pipe2 succeeded, so these are open fds nothing else owns; OwnedFd closes them on every path out.
   let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
   let wfd = write_end.as_raw_fd();
-  let mut cmd = Command::new("bootc");
+  let mut cmd = Command::new(program);
   cmd
     .arg(sub)
     .args(["--progress-fd", "3"])
@@ -343,19 +344,35 @@ fn run_with_progress(cfg: &Config, mode: Mode, args: &[&str]) -> Result<String, 
       if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
     });
   }
-  let mut child = cmd.spawn().map_err(|e| format!("bootc: {e}"))?;
+  let mut child = match cmd.spawn() {
+    Ok(c) => c,
+    Err(e) => {
+      let _ = fs::remove_file(&file);
+      return Err(format!("{program}: {e}"));
+    }
+  };
   drop(write_end);
-  let drain = |pipe: Option<Box<dyn Read + Send>>| {
-    pipe.map(|mut p| {
-      thread::spawn(move || {
+  let drain = |pipe: Option<Box<dyn Read + Send>>| match pipe {
+    None => Ok(None),
+    Some(mut p) => thread::Builder::new()
+      .spawn(move || {
         let mut buf = Vec::new();
         let _ = p.read_to_end(&mut buf);
         buf
       })
-    })
+      .map(Some),
   };
-  let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
-  let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
+  let (so, se) = (child.stdout.take(), child.stderr.take());
+  let (out, err) = match (drain(so.map(|p| Box::new(p) as _)), drain(se.map(|p| Box::new(p) as _))) {
+    (Ok(out), Ok(err)) => (out, err),
+    _ => {
+      // No thread to drain with: end the command (a drain thread that did start ends at EOF) and run it plainly.
+      let _ = child.kill();
+      let _ = child.wait();
+      let _ = fs::remove_file(&file);
+      return run(program, args);
+    }
+  };
   let now = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
   let mut last = (0, 0);
   let mut written: Option<Instant> = None;
@@ -366,16 +383,19 @@ fn run_with_progress(cfg: &Config, mode: Mode, args: &[&str]) -> Result<String, 
     if !matches!(lines.read_until(b'\n', &mut line), Ok(n) if n > 0) {
       break;
     }
-    let Some((done, total)) = parse_progress(&String::from_utf8_lossy(&line)) else {
-      continue;
-    };
-    last = (done, total);
-    if total > 0 && written.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
-      let _ = write_progress(&cfg.status_dir, &progress_json(false, done, total, mode, now()));
+    let parsed = parse_progress(&String::from_utf8_lossy(&line));
+    if let Some(p) = parsed {
+      last = p;
+    }
+    let age = written.map(|t| t.elapsed());
+    let byte_event_due = parsed.is_some() && (last.0 >= last.1 || age.is_none_or(|a| a >= Duration::from_secs(1)));
+    let stale = age.is_some_and(|a| a >= Duration::from_secs(60));
+    if last.1 > 0 && (byte_event_due || stale) {
+      let _ = write_progress(&cfg.status_dir, &progress_json(false, last.0, last.1, mode, now()));
       written = Some(Instant::now());
     }
   }
-  // After an read error bootc may still write: drain so it can't block.
+  // After a read error bootc may still write: drain so it can't block.
   let _ = io::copy(&mut lines, &mut io::sink());
   let status = child.wait();
   let join = |h: Option<thread::JoinHandle<Vec<u8>>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
@@ -389,11 +409,11 @@ fn run_with_progress(cfg: &Config, mode: Mode, args: &[&str]) -> Result<String, 
     status => {
       let _ = fs::remove_file(&file);
       if status.is_ok() && refused_progress_fd(&stderr) {
-        return run("bootc", args);
+        return run(program, args);
       }
       let why = status.map_or_else(|e| e.to_string(), |s| s.to_string());
       Err(format!(
-        "bootc {}: {why}: {}{}",
+        "{program} {}: {why}: {}{}",
         args.join(" "),
         stdout.trim(),
         stderr.trim()
@@ -563,7 +583,13 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
     };
     let result = match step {
       Err(e) => Err(e),
-      Ok((Step::Stay | Step::Check, _)) => Ok(()),
+      Ok((Step::Stay | Step::Check, host)) => {
+        // A `downloaded` file with nothing (usable) staged would have the app promise a restart forever.
+        if host.staged.as_ref().is_none_or(|(digest, _)| bad.contains(digest)) {
+          let _ = fs::remove_file(cfg.status_dir.join(PROGRESS_FILE));
+        }
+        Ok(())
+      }
       Ok((Step::Switch { image, download_only }, _)) => {
         eprintln!("host update: following {image}");
         let mut args = vec!["switch", "--quiet"];
@@ -571,7 +597,7 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
           args.push("--download-only");
         }
         args.push(&image);
-        run_with_progress(&cfg, settings.mode, &args).map(drop)
+        run_with_progress("bootc", &cfg, settings.mode, &args).map(drop)
       }
       Ok((Step::Stage { download_only }, host)) => {
         eprintln!("host update: downloading {}", host.cached.as_deref().unwrap_or("?"));
@@ -580,7 +606,7 @@ pub fn run_updater(cfg: Config, start: Instant, last_input: Arc<AtomicU64>) {
         } else {
           &["upgrade", "--quiet"]
         };
-        run_with_progress(&cfg, settings.mode, args).map(drop)
+        run_with_progress("bootc", &cfg, settings.mode, args).map(drop)
       }
       Ok((Step::Apply { from_downloaded }, host)) => {
         let digest = host.staged.map(|(d, _)| d).unwrap_or_default();
@@ -795,7 +821,8 @@ mod tests {
     );
   }
 
-  const BYTES_LINE: &str = r#"{"type":"ProgressBytes","task":"pulling","description":"Pulling Image","id":"sha256:bbb","bytesCached":0,"bytes":312000000,"bytesTotal":740000000,"stepsCached":0,"steps":3,"stepsTotal":9,"subtasks":[{"subtask":"layer","description":"x","id":"l1","bytesCached":0,"bytes":5,"bytesTotal":6}]}"#;
+  // bootc writes canonical JSON: keys sorted, so `bytes` and `bytesTotal` precede `subtasks` (whose entries repeat them).
+  const BYTES_LINE: &str = r#"{"bytes":312000000,"bytesCached":0,"bytesTotal":740000000,"description":"Pulling Image","id":"sha256:bbb","steps":3,"stepsCached":0,"stepsTotal":9,"subtasks":[{"bytes":5,"bytesCached":0,"bytesTotal":6,"description":"x","id":"l1","subtask":"layer"}],"task":"pulling","type":"ProgressBytes"}"#;
 
   #[test]
   fn reads_bootc_progress_lines() {
@@ -849,5 +876,94 @@ mod tests {
   #[test]
   fn a_window_hour_past_1092_is_no_window() {
     assert_eq!(parse_window("1093:00/60m"), None);
+  }
+
+  /// A fake `bootc` (a shell script) under a fresh folder, plus a config whose status folder is inside it. Tests that
+  /// write and then exec scripts hold `SCRIPTS`: a fork in another test thread would otherwise carry the script's
+  /// still-open write fd into its child and fail the exec with ETXTBSY.
+  fn fake_bootc(name: &str, body: &str) -> (std::path::PathBuf, Config) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("tc-fake-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("status")).unwrap();
+    let script = base.join("bootc");
+    fs::write(
+      &script,
+      format!("#!/bin/sh\nSTATUS={}\n{body}\n", base.join("status").display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg = Config {
+      status_dir: base.join("status"),
+      ..Config::default()
+    };
+    (base, cfg)
+  }
+
+  static SCRIPTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+  const PULL: &str = r#"echo '{"type":"Start","version":"0.1.0"}' >&3
+echo '{"bytes":5,"bytesTotal":9,"type":"ProgressBytes"}' >&3
+echo '{"bytes":9,"bytesTotal":9,"type":"ProgressBytes"}' >&3
+echo '{"steps":1,"stepsTotal":2,"type":"ProgressSteps"}' >&3"#;
+
+  #[test]
+  fn progress_runs_end_to_end_and_ends_downloaded() {
+    let _guard = SCRIPTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The snapshot is taken while the script still runs: the 100% line (within a second of the 5/9 write) must be there.
+    let (base, cfg) = fake_bootc(
+      "ok",
+      &format!("{PULL}\nsleep 0.3\ncp \"$STATUS/host-update.json\" \"$STATUS/../snap\"\necho \"$@\"\necho warn >&2"),
+    );
+    let program = base.join("bootc");
+    let out = run_with_progress(
+      program.to_str().unwrap(),
+      &cfg,
+      Mode::Immediate,
+      &["upgrade", "--quiet"],
+    )
+    .unwrap();
+    assert_eq!(out, "upgrade --progress-fd 3 --quiet\n");
+    let snap = fs::read_to_string(base.join("snap")).unwrap();
+    assert!(snap.contains(r#""state":"downloading","done":9,"total":9"#), "{snap}");
+    let last = fs::read_to_string(cfg.status_dir.join(PROGRESS_FILE)).unwrap();
+    assert!(last.contains(r#""state":"downloaded","done":9,"total":9"#), "{last}");
+    let _ = fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn a_failed_command_leaves_no_progress_file() {
+    let _guard = SCRIPTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base, cfg) = fake_bootc("fail", &format!("{PULL}\necho boom >&2\nexit 1"));
+    let program = base.join("bootc");
+    let err = run_with_progress(program.to_str().unwrap(), &cfg, Mode::Immediate, &["upgrade"]).unwrap_err();
+    assert!(err.contains("boom"), "{err}");
+    assert!(!cfg.status_dir.join(PROGRESS_FILE).exists());
+    // A spawn failure removes a leftover file too.
+    write_progress(&cfg.status_dir, "old").unwrap();
+    let missing = base.join("no-such-bootc");
+    assert!(run_with_progress(missing.to_str().unwrap(), &cfg, Mode::Immediate, &["upgrade"]).is_err());
+    assert!(!cfg.status_dir.join(PROGRESS_FILE).exists());
+    let _ = fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn a_bootc_refusing_the_flag_is_rerun_without_it() {
+    let _guard = SCRIPTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (base, cfg) = fake_bootc(
+      "old",
+      "case \"$*\" in *--progress-fd*) echo \"error: unexpected argument '--progress-fd' found\" >&2; exit 2;; esac\necho \"ran $*\"",
+    );
+    let program = base.join("bootc");
+    let out = run_with_progress(
+      program.to_str().unwrap(),
+      &cfg,
+      Mode::Immediate,
+      &["upgrade", "--quiet"],
+    )
+    .unwrap();
+    assert_eq!(out, "ran upgrade --quiet\n");
+    assert!(!cfg.status_dir.join(PROGRESS_FILE).exists());
+    let _ = fs::remove_dir_all(&base);
   }
 }
