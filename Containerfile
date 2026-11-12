@@ -9,6 +9,8 @@ FROM docker.io/library/rust:1 AS standby
 ARG STANDBY_REF=2d6e05ee3b962ca4134270b2a96f0e006e5cf851
 RUN git init -q /s && git -C /s fetch -q --depth 1 https://github.com/AetherBreaker/timeclock-standby.git "$STANDBY_REF" \
   && git -C /s checkout -q FETCH_HEAD \
+  # A ref before v0.4.0 would run the watcher's own updater beside timeclock-updater.
+  && test ! -e /s/watcher/src/update.rs \
   && rustup target add x86_64-unknown-linux-musl \
   && cd /s/watcher && cargo build --release --locked --target x86_64-unknown-linux-musl
 
@@ -65,7 +67,7 @@ RUN set -eu; \
     /etc/coolify-tunnel /etc/timeclock/updater.conf /etc/sway/config.d /usr/share/timeclock \
     /etc/pam.d/timeclock-display /etc/profile.d/timeclock-tmout.sh /etc/xdg/xdg-desktop-portal-wlr \
     /usr/lib/systemd/system/plymouth-reboot.service.d /usr/lib/systemd/system/sweetfiresupportdesk.service \
-    /usr/lib/systemd/user/*.d /usr/share/plymouth/themes/timeclock -type f -exec chmod 644 {} +; \
+    /usr/lib/systemd/user/*.d/timeclock-* /usr/share/plymouth/themes/timeclock -type f -exec chmod 644 {} +; \
   chmod 700 /etc/coolify-tunnel; chmod 755 /usr/bin/coolify-tunnel-setup /usr/libexec/timeclock/*; \
   chmod 644 /usr/libexec/timeclock/sway.conf /usr/libexec/timeclock/clock-start.html
 
@@ -107,4 +109,6 @@ RUN set -eu; ln -s var/data /data; \
     timeclock-display.service timeclock-standby.service timeclock-clock.service timeclock-remote.service \
     timeclock-tty1.service timeclock-update-splash.service sweetfiresupportdesk.service timeclock-grub-hidden.service \
     timeclock-coolify-network.service timeclock-boot-entries.service; \
+  # smartmontools is here for smartctl only: smartd stays off (disabled, not masked, so it can be started by hand).
+  systemctl disable smartd.service; \
   bootc container lint
