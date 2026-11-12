@@ -1,0 +1,11 @@
+[Unit]
+Description=Timeclock host updater: keeps this host on its channel's newest release
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timeclock-updater
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
