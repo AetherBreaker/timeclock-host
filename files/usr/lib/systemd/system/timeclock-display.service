@@ -1,8 +1,9 @@
 [Unit]
 Description=Timeclock display: sway on terminal 7, showing the standby and the clock
 After=systemd-user-sessions.service plymouth-start.service timeclock-status.service
-# As display managers do: only display.sh quits the splash, once it has switched terminals. Debian's quit, run beside it,
-# put terminal 1 back in text mode and its boot messages showed for a moment (main-warehouse, 2026-10-29); it runs only
+# As display managers do: only display.sh quits the splash, once it has switched terminals. The distribution's
+# plymouth-quit, run beside it, put terminal 1 back in text mode and its boot messages showed for a moment
+# (main-warehouse, 2026-10-29); it runs only
 # if the display fails.
 Conflicts=plymouth-quit.service
 After=plymouth-quit.service

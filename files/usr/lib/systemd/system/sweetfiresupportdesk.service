@@ -1,5 +1,5 @@
 # RustDesk (the owner's client, Sweet Fire Support Desk), unpacked from the data folder by timeclock-remote.service. Its
-# package's own unit, plus the host's drop-in: it picks the screen's session once, at start, so it starts once
+# package's own unit with the clock's changes folded in: it picks the screen's session once, at start, so it starts once
 # sway answers (up to a minute, then anyway) and restarts with the display; its screen process needs the session's
 # Wayland socket and bus for the screen-sharing portal.
 [Unit]
