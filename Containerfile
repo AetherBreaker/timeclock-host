@@ -91,7 +91,8 @@ RUN set -eu; logo=/usr/share/timeclock/branding/SFT-Logo-June-2022-color.svg; \
   rmdir /var/roothome; ls -la "$img"; [ "$(stat -c %s "$img")" -lt 140000000 ]; \
   lsinitrd -m "$img" | sed -n '/^dracut modules:/,/^=/p' | tr ' ' '\n' | sort > /tmp/after; \
   echo "initramfs modules lost:"; comm -23 /tmp/before /tmp/after; echo "gained:"; comm -13 /tmp/before /tmp/after; \
-  ! comm -23 /tmp/before /tmp/after | grep -q .; rm /tmp/before /tmp/after
+  # `set -e` ignores a negated pipeline, so the failure is explicit.
+  if comm -23 /tmp/before /tmp/after | grep -q .; then echo "initramfs lost modules" >&2; exit 1; fi; rm /tmp/before /tmp/after
 
 # The host's version: the release tag, stamped by publish.yml (`poe release`); "dev" for a build by hand. bootc status
 # shows it (the image's version label), and os-release carries it for the app, which reads the host's os-release
@@ -120,5 +121,5 @@ RUN set -eu; ln -s var/data /data; \
   # policy lacks: no file-context type may be new against the base.
   grep -oE 'object_r:[a-z0-9_]+' /etc/selinux/targeted/contexts/files/file_contexts | sort -u > /tmp/fc-types.after; \
   echo "file-context types gained:"; comm -13 /tmp/fc-types.base /tmp/fc-types.after; \
-  ! comm -13 /tmp/fc-types.base /tmp/fc-types.after | grep -q .; rm /tmp/fc-types.base /tmp/fc-types.after; \
+  if comm -13 /tmp/fc-types.base /tmp/fc-types.after | grep -q .; then echo "new SELinux file-context types" >&2; exit 1; fi; rm /tmp/fc-types.base /tmp/fc-types.after; \
   bootc container lint
