@@ -125,9 +125,12 @@ pub struct Host {
   pub booted: String,
   /// A staged release: its digest, and whether it was downloaded only (applied by `--from-downloaded`, not any reboot).
   pub staged: Option<(String, bool)>,
-  /// A newer release seen by the last `bootc upgrade --check`.
+  /// A newer release seen by the last `bootc upgrade --check`, as the booted release's record has it.
   pub cached: Option<String>,
   pub has_rollback: bool,
+  /// The rollback release's digest, and the newer release its record names.
+  pub rollback: Option<String>,
+  pub rollback_cached: Option<String>,
 }
 
 fn at<'a>(j: &'a Json, path: &[&str]) -> Option<&'a Json> {
@@ -153,6 +156,8 @@ pub fn parse_status(text: &str) -> Option<Host> {
     }),
     cached: str_at(&j, &["status", "booted", "cachedUpdate", "imageDigest"]),
     has_rollback: matches!(at(&j, &["status", "rollback"]), Some(Json::Object(_))),
+    rollback: str_at(&j, &["status", "rollback", "image", "imageDigest"]),
+    rollback_cached: str_at(&j, &["status", "rollback", "cachedUpdate", "imageDigest"]),
   })
 }
 
@@ -219,7 +224,14 @@ pub fn next_step(
   if !checked {
     return Step::Check;
   }
-  match &host.cached {
+  // A check records what it finds on the newest downloaded release, and status shows each release's own record. After a
+  // rollback the newest download is the bad release in the rollback slot, so its record is the current one; the booted
+  // release's stays on the bad release for good.
+  let cached = match &host.rollback {
+    Some(r) if bad.contains(r) => &host.rollback_cached,
+    _ => &host.cached,
+  };
+  match cached {
     Some(c) if *c != host.booted && !bad.contains(c) => Step::Stage { download_only: window },
     _ => Step::Stay,
   }
@@ -712,7 +724,8 @@ mod tests {
     "transport":"registry"},"version":"44","timestamp":null,"imageDigest":"sha256:aaa","architecture":"amd64"},
     "cachedUpdate":{"image":{"image":"ghcr.io/aetherbreaker/timeclock-host:latest","transport":"registry"},
     "imageDigest":"sha256:bbb"},"incompatible":false,"pinned":false,"store":"ostreeContainer"},
-    "rollback":{"image":{"imageDigest":"sha256:000"}},"rollbackQueued":false,"type":"bootcHost"}}"#;
+    "rollback":{"image":{"imageDigest":"sha256:000"},"cachedUpdate":{"imageDigest":"sha256:ccc"}},
+    "rollbackQueued":false,"type":"bootcHost"}}"#;
 
   #[test]
   fn reads_bootc_status() {
@@ -722,6 +735,8 @@ mod tests {
     assert_eq!(h.cached.as_deref(), Some("sha256:bbb"));
     assert_eq!(h.staged, None);
     assert!(h.has_rollback);
+    assert_eq!(h.rollback.as_deref(), Some("sha256:000"));
+    assert_eq!(h.rollback_cached.as_deref(), Some("sha256:ccc"));
     let staged = STATUS.replace(
       r#""staged":null"#,
       r#""staged":{"image":{"imageDigest":"sha256:bbb"},"downloadOnly":true}"#,
@@ -772,6 +787,39 @@ mod tests {
       ),
       Step::Stay
     );
+  }
+
+  /// The dev clock on 2026-11-12: rolled back from sha256:bad, the booted release's record still names sha256:bad
+  /// while the check's finding (sha256:ccc) sits on the rolled-back release.
+  #[test]
+  fn after_a_rollback_a_newer_release_is_still_taken() {
+    let s = Settings::default();
+    let bad = ["sha256:bad".to_string()];
+    let rolled_back = Host {
+      cached: Some("sha256:bad".into()),
+      has_rollback: true,
+      rollback: Some("sha256:bad".into()),
+      rollback_cached: Some("sha256:ccc".into()),
+      ..host()
+    };
+    assert_eq!(
+      next_step(&rolled_back, &s, BASE, &bad, true, true, 600),
+      Step::Stage { download_only: false }
+    );
+    let nothing_newer = Host {
+      rollback_cached: None,
+      ..rolled_back.clone()
+    };
+    assert_eq!(next_step(&nothing_newer, &s, BASE, &bad, true, true, 600), Step::Stay);
+    // A good release in the rollback slot (an ordinary update) keeps the booted release's record.
+    let updated = Host {
+      cached: None,
+      has_rollback: true,
+      rollback: Some("sha256:old".into()),
+      rollback_cached: Some("sha256:zzz".into()),
+      ..host()
+    };
+    assert_eq!(next_step(&updated, &s, BASE, &bad, true, true, 600), Step::Stay);
   }
 
   #[test]
