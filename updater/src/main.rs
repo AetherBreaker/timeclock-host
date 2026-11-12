@@ -30,7 +30,7 @@ fn main() {
   let last_input_ms = Arc::new(AtomicU64::new(u64::MAX));
   {
     let last_input_ms = Arc::clone(&last_input_ms);
-    thread::spawn(move || {
+    let spawned = thread::Builder::new().spawn(move || {
       let mut inputs = Inputs::default();
       let mut rescanned = Instant::now();
       loop {
@@ -60,6 +60,9 @@ fn main() {
         }
       }
     });
+    if let Err(e) = spawned {
+      eprintln!("input tracking thread: {e}; updating without it (the screen counts as idle)");
+    }
   }
   update::run_updater(cfg, start, last_input_ms);
 }
