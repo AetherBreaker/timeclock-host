@@ -1,0 +1,17 @@
+[Unit]
+Description=Timeclock screen recorder: keeps clips of the clock window around every interaction, freeze and crash
+# It captures through sway's Wayland socket; it waits and reconnects while sway is down. Not part of the updater's health
+# check: a broken recorder must never roll back a host release (it alerts through the app instead).
+After=timeclock-display.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timeclock-recorder
+Restart=always
+RestartSec=5
+# Below the clock app: it drops frames rather than slow the clock. Post-processing runs at SCHED_IDLE on its own.
+Nice=10
+Environment=XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-1
+
+[Install]
+WantedBy=multi-user.target

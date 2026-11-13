@@ -26,6 +26,25 @@ While a release downloads, the updater keeps `host-update.json` in the app's sta
 when it installs. The file stays through the restart, so the toast does too; the updater removes it as it starts on the
 next boot, before Docker starts the app.
 
+## Screen recorder
+
+The recorder (`recorder/`, `timeclock-recorder.service`, settings in `/etc/timeclock/recorder.conf`) keeps clips of
+the clock window around every touch, key, mouse click, fingerprint scan, freeze and vanished window, from 15 s before
+the first until 15 s pass with none (timeclock-system's `docs/superpowers/specs/2026-11-13-screen-recorder-design.md`).
+
+- **Capture:** sway's output, cropped to the clock window, only when the screen changes (at most 30 frames a second);
+  OpenH264 from the image. It runs below the app's priority and drops frames rather than slow the clock.
+- **Clips** go to `/data/timeclock_system_files/recordings`, named by the local time their footage starts:
+  `<name>.h264` (raw), `<name>.frames` (each frame's capture time and length), `<name>.txt` (what happened, line by
+  line), and `<name>.mp4` (30 fps, with each frame's capture time, touch rings and a freeze timer; made afterwards at
+  idle priority). `live/` holds the last few seconds between clips. The folder is capped at 40 GB, oldest clips first.
+- **The app's status folder:** the app writes `scan` when a finger lands on the reader (and, with screen off, `asleep`
+  while the clock sleeps, which pauses recording); the recorder writes `recording` (the open clip's name, for crash
+  records and alerts) and `recorder.json` (every minute; the app alerts when it goes stale).
+- **Freezes:** the app's page flips a 4x4 block in its top-left corner four times a second; no change for 15 frames or
+  1 s is a freeze.
+- A broken recorder isn't part of the updater's health check, so it never rolls back a host release.
+
 ## Build
 
 ```sh

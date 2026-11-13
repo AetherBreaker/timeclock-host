@@ -5,3 +5,4 @@ work/
 .venv/
 .cache/
 updater/target/
+recorder/target/

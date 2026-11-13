@@ -20,6 +20,13 @@ COPY updater /u
 RUN rustup target add x86_64-unknown-linux-musl && cd /u && cargo test --locked \
   && cargo build --release --locked --target x86_64-unknown-linux-musl
 
+# The screen recorder: tested in the build like the updater, but a glibc build, since it loads the image's OpenH264 at
+# run time and a static musl binary can't load a library. It uses the updater's crate by path, so both sit side by side.
+FROM docker.io/library/rust:1 AS recorder
+COPY updater /src/updater
+COPY recorder /src/recorder
+RUN cd /src/recorder && cargo test --locked && cargo build --release --locked
+
 FROM quay.io/fedora/fedora-coreos:stable
 # Links the published package to this repository (and the repository's Actions to it).
 LABEL org.opencontainers.image.source=https://github.com/AetherBreaker/timeclock-host
@@ -41,6 +48,8 @@ RUN grep -oE 'object_r:[a-z0-9_]+' /etc/selinux/targeted/contexts/files/file_con
     dpkg avahi NetworkManager-wifi NetworkManager-config-connectivity-fedora wpa_supplicant \
     realtek-firmware iwlwifi-mvm-firmware iwlwifi-dvm-firmware mt7xxx-firmware atheros-firmware \
     docker-compose smartmontools gtk3 libxdo libXfixes alsa-lib libva gstreamer1-plugins-base dejavu-sans-fonts \
+    # The screen recorder's encoder (the base's fedora-cisco-openh264 repo): named so the build fails if the base drops it.
+    openh264 \
   && rpm -q xdg-desktop-portal-wlr | grep -q '^xdg-desktop-portal-wlr-0\.7\.1-' \
   # smartmontools-selinux (a rich dependency) adds a policy module with a new type, smartdwarn_script_t, that a host whose
   # loaded policy lacks it can't import (fsetxattr EINVAL, so every `bootc upgrade` fails); the base's smartmon module covers smartd.
@@ -52,6 +61,7 @@ RUN grep -oE 'object_r:[a-z0-9_]+' /etc/selinux/targeted/contexts/files/file_con
 # screen's to /usr/libexec/timeclock-standby, and the watcher to /usr/bin, where timeclock-standby's units expect them.
 COPY --from=standby /s/watcher/target/x86_64-unknown-linux-musl/release/timeclock-watcher /usr/bin/timeclock-watcher
 COPY --from=updater /u/target/x86_64-unknown-linux-musl/release/timeclock-updater /usr/bin/timeclock-updater
+COPY --from=recorder /src/recorder/target/release/timeclock-recorder /usr/bin/timeclock-recorder
 COPY --from=standby /s /tmp/standby
 RUN set -eu; cd /tmp/standby; S=/usr/libexec/timeclock-standby; install -d "$S"; \
   install -m 644 status/status.py status/standby.html status/standby.css status/fallback.html "$S"/; \
@@ -70,7 +80,7 @@ RUN set -eu; \
   find /usr/lib/systemd/system/timeclock-* /usr/lib/systemd/system/docker.service.d /usr/lib/tmpfiles.d \
     /usr/lib/systemd/user/timeclock-* /usr/lib/bootc/kargs.d /usr/lib/sysctl.d /usr/lib/modprobe.d /usr/lib/NetworkManager/conf.d /etc/ssh/sshd_config.d \
     /etc/ssh/ssh_config.d/40-coolify-tunnel.conf \
-    /etc/coolify-tunnel /etc/timeclock/updater.conf /etc/sway/config.d /usr/share/timeclock \
+    /etc/coolify-tunnel /etc/timeclock/updater.conf /etc/timeclock/recorder.conf /etc/sway/config.d /usr/share/timeclock \
     /etc/pam.d/timeclock-display /etc/profile.d/timeclock-tmout.sh /etc/xdg/xdg-desktop-portal-wlr \
     /usr/lib/systemd/system/plymouth-reboot.service.d /usr/lib/systemd/system/sweetfiresupportdesk.service \
     /usr/lib/systemd/user/*.d/timeclock-* /usr/share/plymouth/themes/timeclock -type f -exec chmod 644 {} +; \
@@ -112,7 +122,8 @@ RUN set -eu; ln -s var/data /data; \
   ln -s /usr/share/sweetfiresupportdesk/sweetfiresupportdesk /usr/bin/sweetfiresupportdesk; \
   systemctl mask getty@tty1.service sleep.target suspend.target hibernate.target hybrid-sleep.target \
     zincati.service bootc-fetch-apply-updates.timer; \
-  systemctl enable docker.service avahi-daemon.service timeclock-watcher.service timeclock-updater.service timeclock-status.service \
+  systemctl enable docker.service avahi-daemon.service timeclock-watcher.service timeclock-updater.service \
+    timeclock-recorder.service timeclock-status.service \
     timeclock-display.service timeclock-standby.service timeclock-clock.service timeclock-remote.service \
     timeclock-tty1.service timeclock-update-splash.service sweetfiresupportdesk.service timeclock-grub-hidden.service \
     timeclock-coolify-network.service timeclock-boot-entries.service; \
