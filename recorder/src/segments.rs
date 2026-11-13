@@ -11,6 +11,14 @@ pub struct SegmentInfo {
   pub end: Micros,
 }
 
+/// `remove_file` that treats an already-missing file as done, so a retried delete never wedges.
+fn remove_if_present(path: &Path) -> io::Result<()> {
+  match fs::remove_file(path) {
+    Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+    _ => Ok(()),
+  }
+}
+
 struct Current {
   info: SegmentInfo,
   h264: BufWriter<File>,
@@ -42,31 +50,49 @@ impl Segments {
       finished: Vec::new(),
       current: None,
     };
+    // Only `<digits>.h264` / `<digits>.frames` are segments; anything else in the folder is left alone.
     let mut seqs = std::collections::BTreeSet::new();
     for entry in fs::read_dir(&this.dir)? {
       let path = entry?.path();
-      if let Some(seq) = path
+      let is_segment = matches!(path.extension().and_then(|e| e.to_str()), Some("h264" | "frames"));
+      let seq = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .and_then(|s| s.parse::<u64>().ok())
-      {
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()));
+      if let (true, Some(seq)) = (is_segment, seq.and_then(|s| s.parse::<u64>().ok())) {
         seqs.insert(seq);
       }
     }
     for seq in seqs {
       this.next_seq = seq + 1;
       let (h264, frames) = this.paths(seq);
-      let times: Vec<Micros> = fs::read_to_string(&frames)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.trim().parse().ok())
-        .collect();
-      match (times.first(), times.last()) {
-        (Some(&start), Some(&end)) if h264.exists() => this.finished.push(SegmentInfo { seq, start, end }),
-        _ => {
-          let _ = fs::remove_file(&h264);
-          let _ = fs::remove_file(&frames);
+      // A crash between the two per-frame writes (or ENOSPC) can leave a torn last `.frames` line or h264 bytes with
+      // no line. Keep only complete `<micros> <bytes>` lines whose bytes are all in the `.h264`, then cut both files
+      // to exactly those, so frame lines and bytes stay aligned.
+      let h264_len = fs::metadata(&h264).map_or(0, |m| m.len());
+      let text = fs::read(&frames).unwrap_or_default();
+      let (mut times, mut good_lines, mut good_bytes) = (Vec::new(), 0u64, 0u64);
+      for line in text.split_inclusive(|&b| b == b'\n').filter(|l| l.ends_with(b"\n")) {
+        let parsed = std::str::from_utf8(line).ok().and_then(|l| {
+          let (at, len) = l.trim_end().split_once(' ')?;
+          Some((at.parse::<Micros>().ok()?, len.parse::<u64>().ok()?))
+        });
+        match parsed {
+          Some((at, len)) if good_bytes + len <= h264_len => {
+            times.push(at);
+            good_lines += line.len() as u64;
+            good_bytes += len;
+          }
+          _ => break,
         }
+      }
+      if let (Some(&start), Some(&end)) = (times.first(), times.last()) {
+        OpenOptions::new().write(true).open(&frames)?.set_len(good_lines)?;
+        OpenOptions::new().write(true).open(&h264)?.set_len(good_bytes)?;
+        this.finished.push(SegmentInfo { seq, start, end });
+      } else {
+        remove_if_present(&h264)?;
+        remove_if_present(&frames)?;
       }
     }
     Ok(this)
@@ -97,8 +123,8 @@ impl Segments {
     Ok(())
   }
 
-  /// Appends one frame's Annex B bytes and its time, flushed per frame so a crash keeps every frame written. The
-  /// bytes go first, so a frame line never points at missing data.
+  /// Appends one frame's Annex B bytes, then its `<micros> <bytes>` line, flushed per frame so a crash keeps every
+  /// frame written. Bytes first, so a line never points at missing data; `open` cuts any torn tail.
   pub fn write(&mut self, at: Micros, annexb: &[u8]) -> io::Result<()> {
     let cur = self
       .current
@@ -106,7 +132,7 @@ impl Segments {
       .ok_or_else(|| io::Error::other("no segment is open"))?;
     cur.h264.write_all(annexb)?;
     cur.h264.flush()?;
-    writeln!(cur.frames, "{at}")?;
+    writeln!(cur.frames, "{at} {}", annexb.len())?;
     cur.frames.flush()?;
     cur.info.end = at;
     Ok(())
@@ -152,40 +178,53 @@ impl Segments {
   /// Deletes finished segments that ended before `older_than`.
   pub fn prune(&mut self, older_than: Micros) -> io::Result<()> {
     let (old, keep): (Vec<SegmentInfo>, Vec<SegmentInfo>) = self.finished.iter().partition(|s| s.end < older_than);
-    for s in &old {
-      let (h264, frames) = self.paths(s.seq);
-      fs::remove_file(h264)?;
-      fs::remove_file(frames)?;
-    }
     self.finished = keep;
-    Ok(())
+    self.delete(&old)
   }
 
-  /// Appends every finished segment with `start >= from`, in order, to `<dir>/<name>.h264` and `.frames`, then
-  /// deletes them. The open segment is left alone: a closing clip `finish`es first.
+  /// Deletes every listed segment's files even if one delete fails (NotFound is fine), then returns the first error.
+  /// Callers drop the segments from `finished` first, so a failure never leaves state a retry would trip on.
+  fn delete(&self, segments: &[SegmentInfo]) -> io::Result<()> {
+    let mut first = Ok(());
+    for s in segments {
+      let (h264, frames) = self.paths(s.seq);
+      for r in [remove_if_present(&h264), remove_if_present(&frames)] {
+        first = first.and(r);
+      }
+    }
+    first
+  }
+
+  /// Writes every finished segment with `start >= from`, in order, as `<dir>/<name>.h264` and `.frames`, then deletes
+  /// the segments. Retry-safe: the clip is built in truncated `.part` files and renamed into place before any delete,
+  /// so a retry or a crash-and-recover rebuilds the same clip instead of appending a duplicate. Nothing to take
+  /// creates no files. A segment missing either file is skipped as a pair. The open segment is left alone: a closing
+  /// clip `finish`es first.
   pub fn join(&mut self, from: Micros, dir: &Path, name: &str) -> io::Result<()> {
-    let append = |ext: &str| {
-      OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(format!("{name}.{ext}")))
-    };
-    let (mut out_h264, mut out_frames) = (append("h264")?, append("frames")?);
     let (take, keep): (Vec<SegmentInfo>, Vec<SegmentInfo>) = self.finished.iter().partition(|s| s.start >= from);
+    if take.is_empty() {
+      return Ok(());
+    }
+    let part = |ext: &str| dir.join(format!("{name}.{ext}.part"));
+    let (mut out_h264, mut out_frames) = (File::create(part("h264"))?, File::create(part("frames"))?);
     for s in &take {
       let (h264, frames) = self.paths(s.seq);
-      io::copy(&mut File::open(&h264)?, &mut out_h264)?;
-      io::copy(&mut File::open(&frames)?, &mut out_frames)?;
+      match (File::open(&h264), File::open(&frames)) {
+        (Ok(mut h), Ok(mut f)) => {
+          io::copy(&mut h, &mut out_h264)?;
+          io::copy(&mut f, &mut out_frames)?;
+        }
+        (Err(e), _) | (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => {}
+        (Err(e), _) | (_, Err(e)) => return Err(e),
+      }
     }
     out_h264.sync_all()?;
     out_frames.sync_all()?;
-    for s in &take {
-      let (h264, frames) = self.paths(s.seq);
-      fs::remove_file(h264)?;
-      fs::remove_file(frames)?;
+    for ext in ["h264", "frames"] {
+      fs::rename(part(ext), dir.join(format!("{name}.{ext}")))?;
     }
     self.finished = keep;
-    Ok(())
+    self.delete(&take)
   }
 }
 
@@ -243,7 +282,7 @@ mod tests {
     assert_eq!(fs::read(root.join("clip.h264")).unwrap(), b"cde");
     assert_eq!(
       fs::read_to_string(root.join("clip.frames")).unwrap(),
-      "2000\n3000\n3500\n"
+      "2000 1\n3000 1\n3500 1\n"
     );
     assert_eq!(s.finished().len(), 1);
     assert!(!root.join("live/0000000001.h264").exists());
@@ -269,6 +308,73 @@ mod tests {
     assert!(!root.join("live/0000000009.h264").exists());
     s.begin(5_000).unwrap();
     assert!(root.join("live/0000000010.h264").exists());
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  /// Writes a crash-style segment (seq 3 after `three`) of two one-byte frames and drops it unfinished.
+  fn crashed(root: &Path) {
+    let mut s = three(root);
+    s.begin(4_000).unwrap();
+    s.write(4_000, b"f").unwrap();
+    s.write(4_250, b"g").unwrap();
+  }
+
+  #[test]
+  fn torn_trailing_frames_line_is_cut_at_recovery() {
+    let root = temp_dir("seg-torn");
+    crashed(&root);
+    let mut f = OpenOptions::new()
+      .append(true)
+      .open(root.join("live/0000000003.frames"))
+      .unwrap();
+    f.write_all(b"17630").unwrap();
+    drop(f);
+    let s = Segments::open(root.join("live")).unwrap();
+    assert_eq!(s.finished().last().map(|i| (i.start, i.end)), Some((4_000, 4_250)));
+    assert_eq!(
+      fs::read_to_string(root.join("live/0000000003.frames")).unwrap(),
+      "4000 1\n4250 1\n"
+    );
+    assert_eq!(fs::read(root.join("live/0000000003.h264")).unwrap(), b"fg");
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn h264_bytes_without_a_line_are_cut_at_recovery() {
+    let root = temp_dir("seg-extra");
+    crashed(&root);
+    let mut f = OpenOptions::new()
+      .append(true)
+      .open(root.join("live/0000000003.h264"))
+      .unwrap();
+    f.write_all(b"zz").unwrap();
+    drop(f);
+    Segments::open(root.join("live")).unwrap();
+    assert_eq!(fs::read(root.join("live/0000000003.h264")).unwrap(), b"fg");
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn join_twice_changes_nothing_the_second_time() {
+    let root = temp_dir("seg-twice");
+    let mut s = three(&root);
+    s.join(2_000, &root, "clip").unwrap();
+    s.join(2_000, &root, "clip").unwrap();
+    assert_eq!(fs::read(root.join("clip.h264")).unwrap(), b"cde");
+    s.join(9_000, &root, "none").unwrap();
+    assert!(!root.join("none.h264").exists() && !root.join("none.frames").exists());
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn join_completes_when_a_segment_file_is_already_gone() {
+    let root = temp_dir("seg-gone");
+    let mut s = three(&root);
+    fs::remove_file(root.join("live/0000000001.h264")).unwrap();
+    s.join(2_000, &root, "clip").unwrap();
+    assert_eq!(fs::read(root.join("clip.h264")).unwrap(), b"de");
+    assert!(s.finished().len() == 1);
+    assert!(!root.join("live/0000000001.frames").exists());
     fs::remove_dir_all(root).unwrap();
   }
 

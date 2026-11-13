@@ -61,6 +61,8 @@ pub fn write_alive(dir: &Path, now: Micros, recording: bool) -> io::Result<()> {
 pub enum StatusEvent {
   Asleep(bool),
   Scan(Micros),
+  /// The watch lost events or its folder: reopen it and re-check `asleep_now`.
+  Broken,
 }
 
 /// inotify on the status folder for `asleep` (created/removed by the app) and `scan` (renamed into place).
@@ -80,7 +82,12 @@ impl StatusWatch {
     // SAFETY: `raw` is a fresh, valid fd that nothing else owns.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
-    let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM;
+    let mask = libc::IN_CREATE
+      | libc::IN_DELETE
+      | libc::IN_MOVED_TO
+      | libc::IN_MOVED_FROM
+      | libc::IN_DELETE_SELF
+      | libc::IN_MOVE_SELF;
     // SAFETY: `path` is NUL-terminated and outlives the call.
     if unsafe { libc::inotify_add_watch(raw, path.as_ptr(), mask) } < 0 {
       return Err(io::Error::last_os_error());
@@ -119,6 +126,13 @@ impl StatusWatch {
         let end = (off + 16 + len).min(n);
         let name = &buf[off + 16..end];
         let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+        // Overflow lost events; the folder going away (or being replaced) kills the watch. Either way the caller
+        // must reopen the watch and re-read `asleep_now`.
+        if mask & (libc::IN_Q_OVERFLOW | libc::IN_IGNORED | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+          out.push(StatusEvent::Broken);
+          off = end;
+          continue;
+        }
         let created = mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0;
         let removed = mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0;
         match name {
@@ -187,6 +201,14 @@ mod tests {
     fs::rename(dir.join("scan.tmp"), dir.join("scan")).unwrap();
     assert!(matches!(watch.drain().as_slice(), [StatusEvent::Scan(_)]));
     fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
+  fn watch_reports_a_removed_folder_as_broken() {
+    let dir = temp_dir("status-broken");
+    let watch = StatusWatch::open(&dir).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(watch.drain().contains(&StatusEvent::Broken));
   }
 
   /// Review Focus 1: a missing folder is an error, never created.

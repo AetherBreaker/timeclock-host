@@ -4,16 +4,24 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+fn not_found_is_zero(e: io::Error) -> io::Result<u64> {
+  if e.kind() == io::ErrorKind::NotFound {
+    Ok(0)
+  } else {
+    Err(e)
+  }
+}
+
+/// Files can vanish mid-scan (a segment joined or pruned concurrently), so NotFound counts as zero bytes.
 fn total_size(dir: &Path) -> io::Result<u64> {
   let mut total = 0;
   for entry in fs::read_dir(dir)? {
     let entry = entry?;
-    let meta = entry.metadata()?;
-    total += if meta.is_dir() {
-      total_size(&entry.path())?
-    } else {
-      meta.len()
-    };
+    match entry.metadata() {
+      Ok(meta) if meta.is_dir() => total += total_size(&entry.path()).or_else(not_found_is_zero)?,
+      Ok(meta) => total += meta.len(),
+      Err(e) => not_found_is_zero(e).map(|_| ())?,
+    }
   }
   Ok(total)
 }
@@ -30,7 +38,7 @@ pub fn enforce_cap(dir: &Path, cap_bytes: u64, open: Option<&str>) -> io::Result
   let mut clips: BTreeMap<String, Vec<(PathBuf, u64)>> = BTreeMap::new();
   for entry in fs::read_dir(dir)? {
     let entry = entry?;
-    let meta = entry.metadata()?;
+    let Ok(meta) = entry.metadata() else { continue };
     let file_name = entry.file_name().to_string_lossy().into_owned();
     let name = file_name.split('.').next().unwrap_or_default().to_string();
     if meta.is_file() && !name.is_empty() && Some(name.as_str()) != open {
@@ -42,8 +50,10 @@ pub fn enforce_cap(dir: &Path, cap_bytes: u64, open: Option<&str>) -> io::Result
       break;
     }
     for (path, len) in files {
-      fs::remove_file(path)?;
-      total -= len;
+      match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => total = total.saturating_sub(len),
+      }
     }
     deleted.push(name);
   }
