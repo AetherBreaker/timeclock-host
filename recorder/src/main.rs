@@ -646,6 +646,10 @@ fn live(cfg: Config) -> ! {
       batch.extend(inbox.try_iter());
       batch.push(Msg::Tick(now_micros()));
     }
+    // A stop pre-empts everything queued with it: the tick could split the clip the stop is about to close.
+    if let Some(&stop) = batch.iter().find(|m| matches!(m, Msg::Stop(_))) {
+      batch = vec![stop];
+    }
     for msg in batch {
       let actions = ctl.handle(msg, &env);
       execute(actions, &cfg, ctl.open_clip(), &store, &target, &mut processing);

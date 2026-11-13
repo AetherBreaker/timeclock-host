@@ -422,6 +422,21 @@ mod tests {
     fs::remove_dir_all(root).unwrap();
   }
 
+  /// A clean stop: finishing the open segment and pruning everything leaves `live/` empty, so the next start
+  /// recovers nothing.
+  #[test]
+  fn a_clean_stop_leaves_nothing_to_recover() {
+    let root = temp_dir("seg-stop");
+    let mut s = three(&root);
+    s.begin(4_000).unwrap();
+    s.write(4_000, b"f").unwrap();
+    s.finish().unwrap();
+    s.prune(Micros::MAX).unwrap();
+    assert_eq!(fs::read_dir(root.join("live")).unwrap().count(), 0);
+    assert!(Segments::open(root.join("live")).unwrap().finished().is_empty());
+    fs::remove_dir_all(root).unwrap();
+  }
+
   /// A join that fails before the clip is in place hands its segments back, so they stay tracked and a later prune
   /// deletes them, instead of lingering for recovery to join across the gap.
   #[test]

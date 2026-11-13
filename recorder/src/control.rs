@@ -177,10 +177,20 @@ impl Controller {
       }
       Msg::Scan(at) => self.event(at, "scan".into(), true, env, &mut out),
       Msg::Stop(at) => {
-        // Joined and ended like any close, so `recording` goes (recovery relies on it only after a crash). Processing
+        // A plain close, joined and ended, so `recording` goes (recovery relies on it only after a crash). Processing
         // and the cap are left to the next start: the process is about to exit.
         self.close(at, None, &mut out);
         out.retain(|a| !matches!(a, Action::Closed(_)));
+        // Then every segment no clip holds goes: a clean stop isn't a crash, so it leaves nothing for recovery to turn
+        // into a clip. The generation bump first, so the writer drops queued frames instead of starting a segment.
+        self.generation += 1;
+        self.target = None;
+        out.push(Action::Capture {
+          generation: self.generation,
+          rect: None,
+        });
+        out.push(Action::Finish);
+        out.push(Action::Prune(Micros::MAX));
         return out;
       }
       Msg::Beat { generation, at, beat } => {
@@ -712,20 +722,59 @@ mod tests {
     let (mut c, e) = (ctl(), env());
     shown(&mut c, &e);
     c.handle(touch(30 * S), &e);
+    // Then capture stops and every unheld segment goes, so a clean restart leaves nothing to recover.
+    let cleanup = |generation| {
+      [
+        Action::Capture { generation, rect: None },
+        Action::Finish,
+        Action::Prune(Micros::MAX),
+      ]
+    };
     assert_eq!(
       c.handle(Msg::Stop(33 * S), &e),
       [
-        Action::Join {
-          from: 14 * S,
-          name: "c1".into(),
-          rekey: false,
-        },
-        text("c1", 33 * S, "clip end"),
-        Action::Recording(None),
-        Action::Log("clip /r/c1 ended".into()),
+        &[
+          Action::Join {
+            from: 14 * S,
+            name: "c1".into(),
+            rekey: false,
+          },
+          text("c1", 33 * S, "clip end"),
+          Action::Recording(None),
+          Action::Log("clip /r/c1 ended".into()),
+        ][..],
+        &cleanup(2),
       ]
+      .concat()
     );
-    assert!(ctl().handle(Msg::Stop(33 * S), &e).is_empty());
+    assert_eq!(ctl().handle(Msg::Stop(33 * S), &e), cleanup(1));
+  }
+
+  /// A stop when the clip is already due to split still closes it plainly: no `continues in`, no continuation clip.
+  #[test]
+  fn stop_never_splits() {
+    let (mut c, e) = (ctl(), env());
+    shown(&mut c, &e);
+    for (at, beat) in [(30, 0), (31, 1)] {
+      c.handle(
+        Msg::Beat {
+          generation: 1,
+          at: at * S,
+          beat,
+        },
+        &e,
+      );
+    }
+    c.handle(Msg::Tick(33 * S), &e); // the freeze opens c1 and holds it past max_clip
+    let a = c.handle(Msg::Stop(700 * S), &e);
+    let t = texts(&a);
+    assert!(t.iter().all(|(name, ..)| name == "c1"), "{t:?}");
+    assert!(!t.iter().any(|(_, _, line)| line.starts_with("continues in")), "{t:?}");
+    assert!(a.contains(&Action::Join {
+      from: 16 * S,
+      name: "c1".into(),
+      rekey: false,
+    }));
   }
 
   /// A static screen's segment can start hours back: the join still takes it, but the clip's name and `clip start`
