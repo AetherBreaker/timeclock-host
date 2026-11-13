@@ -8,12 +8,12 @@ use std::time::Duration;
 const GET_TREE: u32 = 4;
 const MAGIC: &[u8] = b"i3-ipc";
 
-/// A JSON value, as much as sway's tree needs: numbers aren't kept.
+/// A JSON value, as much as sway's tree needs.
 #[derive(Debug, PartialEq)]
 pub enum Json {
   Null,
   Bool(bool),
-  Number,
+  Number(f64),
   Str(String),
   Array(Vec<Json>),
   Object(Vec<(String, Json)>),
@@ -103,6 +103,7 @@ impl Parser<'_> {
         Some(Json::Object(fields))
       }
       b'-' | b'0'..=b'9' => {
+        let start = self.i;
         while self
           .s
           .get(self.i)
@@ -110,7 +111,11 @@ impl Parser<'_> {
         {
           self.i += 1;
         }
-        Some(Json::Number)
+        std::str::from_utf8(&self.s[start..self.i])
+          .ok()?
+          .parse()
+          .ok()
+          .map(Json::Number)
       }
       _ => None,
     }
@@ -161,6 +166,38 @@ pub fn window_shown(tree: &Json, app_id: &str) -> Option<bool> {
   })
 }
 
+/// A window's rectangle in sway's layout coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+  pub x: i32,
+  pub y: i32,
+  pub width: u32,
+  pub height: u32,
+}
+
+/// The window with `app_id`: `None` if there's none (or its rect is unreadable), else whether it shows and where it is.
+pub fn window_rect(tree: &Json, app_id: &str) -> Option<(bool, Rect)> {
+  if tree.get("app_id").is_some_and(|v| *v == Json::Str(app_id.into())) {
+    let shown = tree.get("visible") == Some(&Json::Bool(true));
+    let field = |key: &str| match tree.get("rect")?.get(key)? {
+      Json::Number(n) => Some(*n),
+      _ => None,
+    };
+    // `as` saturates, which is fine for on-screen sizes.
+    let rect = Rect {
+      x: field("x")? as i32,
+      y: field("y")? as i32,
+      width: field("width")? as u32,
+      height: field("height")? as u32,
+    };
+    return Some((shown, rect));
+  }
+  ["nodes", "floating_nodes"].iter().find_map(|key| match tree.get(key) {
+    Some(Json::Array(children)) => children.iter().find_map(|c| window_rect(c, app_id)),
+    _ => None,
+  })
+}
+
 /// One request over sway's socket: the reply's payload.
 fn request(socket: &Path, kind: u32, payload: &str) -> io::Result<String> {
   let mut s = UnixStream::connect(socket)?;
@@ -183,10 +220,14 @@ fn request(socket: &Path, kind: u32, payload: &str) -> io::Result<String> {
   String::from_utf8(body).map_err(io::Error::other)
 }
 
+/// sway's window tree now; `Err` when sway doesn't answer or the reply isn't JSON.
+pub fn get_tree(socket: &Path) -> io::Result<Json> {
+  parse_json(&request(socket, GET_TREE, "")?).ok_or_else(|| io::Error::other("unreadable tree"))
+}
+
 /// The clock window as sway sees it now; `Err` when sway doesn't answer.
 pub fn clock_window(socket: &Path, app_id: &str) -> io::Result<Option<bool>> {
-  let tree = parse_json(&request(socket, GET_TREE, "")?).ok_or_else(|| io::Error::other("unreadable tree"))?;
-  Ok(window_shown(&tree, app_id))
+  Ok(window_shown(&get_tree(socket)?, app_id))
 }
 
 #[cfg(test)]
@@ -233,13 +274,28 @@ mod tests {
   }
 
   #[test]
+  fn window_rect_gives_state_and_geometry() {
+    let tree = parse_json(TREE).unwrap();
+    let rect = Rect {
+      x: 0,
+      y: 0,
+      width: 1366,
+      height: 768,
+    };
+    assert_eq!(window_rect(&tree, "local.timeclock.Clock"), Some((false, rect)));
+    assert_eq!(window_rect(&tree, "local.timeclock.Other"), None);
+    // The standby has no rect in the trimmed tree.
+    assert_eq!(window_rect(&tree, "local.timeclock.Standby"), None);
+  }
+
+  #[test]
   fn json_edge_cases() {
     assert_eq!(parse_json(r#""a\"b\\c\/dA""#), Some(Json::Str("a\"b\\c/dA".into())));
     assert_eq!(parse_json("[]"), Some(Json::Array(vec![])));
     assert_eq!(parse_json("{}"), Some(Json::Object(vec![])));
     assert_eq!(
       parse_json(" [true, null, -1.5e3] "),
-      Some(Json::Array(vec![Json::Bool(true), Json::Null, Json::Number]))
+      Some(Json::Array(vec![Json::Bool(true), Json::Null, Json::Number(-1500.0)]))
     );
     assert_eq!(parse_json("[1,]"), None);
     assert_eq!(parse_json(r#"{"a": 1"#), None);

@@ -1,0 +1,15 @@
+[package]
+name = "timeclock-recorder"
+version = "0.1.0"
+edition = "2024"
+description = "Records the clock's screen around interactions, for review"
+publish = false
+
+[dependencies]
+libc = "0.2"
+timeclock-updater = { path = "../updater" }
+
+[profile.release]
+lto = true
+strip = true
+panic = "abort"
