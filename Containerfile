@@ -22,7 +22,9 @@ RUN rustup target add x86_64-unknown-linux-musl && cd /u && cargo test --locked 
 
 # The screen recorder: tested in the build like the updater, but a glibc build, since it loads the image's OpenH264 at
 # run time and a static musl binary can't load a library. It uses the updater's crate by path, so both sit side by side.
-FROM docker.io/library/rust:1 AS recorder
+# Pinned to Debian 13 (glibc 2.41): the binary needs a glibc no newer than the host's, and plain `rust:1` moves to each
+# new Debian release on its own schedule.
+FROM docker.io/library/rust:1-trixie AS recorder
 COPY updater /src/updater
 COPY recorder /src/recorder
 RUN cd /src/recorder && cargo test --locked && cargo build --release --locked
@@ -51,6 +53,8 @@ RUN grep -oE 'object_r:[a-z0-9_]+' /etc/selinux/targeted/contexts/files/file_con
     # The screen recorder's encoder (the base's fedora-cisco-openh264 repo): named so the build fails if the base drops it.
     openh264 \
   && rpm -q xdg-desktop-portal-wlr | grep -q '^xdg-desktop-portal-wlr-0\.7\.1-' \
+  # The recorder's bindings match OpenH264 2.6's ABI and it refuses any other version, so the build fails first.
+  && rpm -q openh264 | grep -q '^openh264-2\.6\.' \
   # smartmontools-selinux (a rich dependency) adds a policy module with a new type, smartdwarn_script_t, that a host whose
   # loaded policy lacks it can't import (fsetxattr EINVAL, so every `bootc upgrade` fails); the base's smartmon module covers smartd.
   && rpm -e --nodeps smartmontools-selinux \
