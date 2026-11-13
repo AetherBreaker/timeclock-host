@@ -200,12 +200,21 @@ impl Segments {
 
   /// `take(from).join(dir, name)`.
   pub fn join(&mut self, from: Micros, dir: &Path, name: &str) -> io::Result<()> {
-    self.take(from).join(dir, name)
+    self.take(from).join(dir, name).map_err(|(e, back)| {
+      self.give_back(back);
+      e
+    })
+  }
+
+  /// Returns a failed join's segments to `finished`, in sequence order.
+  pub fn give_back(&mut self, taken: Taken) {
+    self.finished.extend(taken.segments);
+    self.finished.sort_by_key(|s| s.seq);
   }
 }
 
-/// Segments taken out of the store, to be joined into a clip. If the join fails they stay in `live/`, untracked, and
-/// the next start's recovery makes them a clip.
+/// Segments taken out of the store, to be joined into a clip without holding it.
+#[derive(Debug)]
 pub struct Taken {
   dir: PathBuf,
   segments: Vec<SegmentInfo>,
@@ -228,10 +237,27 @@ impl Taken {
   /// built in truncated `.part` files and renamed into place before any delete, so a crash-and-recover rebuilds the
   /// same clip instead of appending a duplicate. Nothing to join creates no files. A segment missing either file is
   /// skipped as a pair.
-  pub fn join(self, dir: &Path, name: &str) -> io::Result<()> {
+  ///
+  /// A failure before the clip is in place returns the segments for `Segments::give_back`, so they stay tracked (the
+  /// next prune or clip deals with them) instead of lingering in `live/` until recovery joins them, gap and all, with
+  /// whatever else is left. A failed delete afterwards returns nothing to give back: the clip already holds them.
+  pub fn join(self, dir: &Path, name: &str) -> Result<(), (io::Error, Taken)> {
     if self.segments.is_empty() {
       return Ok(());
     }
+    if let Err(e) = self.write_clip(dir, name) {
+      return Err((e, self));
+    }
+    self.delete().map_err(|e| {
+      let nothing = Taken {
+        dir: self.dir.clone(),
+        segments: Vec::new(),
+      };
+      (e, nothing)
+    })
+  }
+
+  fn write_clip(&self, dir: &Path, name: &str) -> io::Result<()> {
     let part = |ext: &str| dir.join(format!("{name}.{ext}.part"));
     let (mut out_h264, mut out_frames) = (File::create(part("h264"))?, File::create(part("frames"))?);
     for s in &self.segments {
@@ -250,7 +276,7 @@ impl Taken {
     for ext in ["h264", "frames"] {
       fs::rename(part(ext), dir.join(format!("{name}.{ext}")))?;
     }
-    self.delete()
+    Ok(())
   }
 }
 
@@ -393,6 +419,28 @@ mod tests {
     let left: Vec<_> = s.finished().iter().map(|i| i.start).collect();
     assert_eq!(left, [1_000, 4_000]);
     assert!(root.join("live/0000000003.h264").exists());
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  /// A join that fails before the clip is in place hands its segments back, so they stay tracked and a later prune
+  /// deletes them, instead of lingering for recovery to join across the gap.
+  #[test]
+  fn a_failed_join_hands_its_segments_back() {
+    let root = temp_dir("seg-fail");
+    let mut s = three(&root);
+    let taken = s.take(2_000);
+    segment(&mut s, &[(4_000, b'f')]);
+    let (_, back) = taken.join(&root.join("missing"), "clip").unwrap_err();
+    s.give_back(back);
+    let tracked: Vec<_> = s.finished().iter().map(|i| (i.seq, i.start)).collect();
+    assert_eq!(tracked, [(0, 1_000), (1, 2_000), (2, 3_000), (3, 4_000)]);
+    s.prune(10_000).unwrap();
+    assert!(s.finished().is_empty());
+    assert_eq!(fs::read_dir(root.join("live")).unwrap().count(), 0);
+    // `Segments::join` does the same on its own.
+    let mut s = three(&root);
+    assert!(s.join(2_000, &root.join("missing"), "clip").is_err());
+    assert_eq!(s.finished().len(), 3);
     fs::remove_dir_all(root).unwrap();
   }
 

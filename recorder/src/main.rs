@@ -446,7 +446,12 @@ fn execute(
           let mut segs = lock(segments);
           segs.finish().map(|()| segs.take(*from))
         };
-        taken.and_then(|taken| taken.join(dir, name))
+        taken.and_then(|taken| {
+          taken.join(dir, name).map_err(|(e, back)| {
+            lock(segments).give_back(back);
+            e
+          })
+        })
       }
       Action::Prune(older_than) => lock(segments).prune(*older_than),
       Action::Text { name, at, line } => textlog::append(dir, name, *at, line),
