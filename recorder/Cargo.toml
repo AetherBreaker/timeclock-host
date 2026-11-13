@@ -7,6 +7,11 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+openh264 = { version = "0.9", default-features = false, features = ["libloading"] }
+# For the version check: `openh264` doesn't re-export the `API` trait that reads it.
+openh264-sys2 = { version = "0.9", default-features = false, features = ["libloading"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 timeclock-updater = { path = "../updater" }
 
 [profile.release]

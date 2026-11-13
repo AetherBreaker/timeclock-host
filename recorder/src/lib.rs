@@ -1,7 +1,9 @@
 //! The screen recorder: records the clock's screen around interactions.
+pub mod capture;
 pub mod clips;
 pub mod clock;
 pub mod config;
+pub mod encode;
 pub mod freeze;
 pub mod input;
 pub mod segments;
