@@ -195,7 +195,6 @@ impl Controller {
           self.freeze_ended(now, now - start, env, &mut out);
         }
         self.freeze.reset();
-        out.push(Action::Finish);
       }
       self.generation += 1;
       self.target = want;
@@ -203,6 +202,11 @@ impl Controller {
         generation: self.generation,
         rect: want,
       });
+      // After the bump: the writer re-checks the generation under the segments lock, so a frame queued before the
+      // stop is either written before this `Finish` or dropped, and never begins a segment nothing would finish.
+      if want.is_none() {
+        out.push(Action::Finish);
+      }
     }
     out
   }
@@ -545,9 +549,10 @@ mod tests {
       t.contains(&("c1".into(), 30 * S, "freeze end 8.000000".into())),
       "{t:?}"
     );
+    // The generation bump comes first, so the writer drops queued frames instead of beginning a segment after it.
     let stop = a.iter().position(|x| *x == Action::Finish).expect("segment finished");
     assert_eq!(
-      a[stop + 1],
+      a[stop - 1],
       Action::Capture {
         generation: 2,
         rect: None
@@ -608,10 +613,13 @@ mod tests {
     let join = a.iter().position(|x| matches!(x, Action::Join { .. })).unwrap();
     let stop = a.iter().position(|x| *x == Action::Finish).unwrap();
     assert!(join < stop);
-    assert!(a.contains(&Action::Capture {
-      generation: 2,
-      rect: None
-    }));
+    assert_eq!(
+      a[stop - 1],
+      Action::Capture {
+        generation: 2,
+        rect: None
+      }
+    );
     // A repeat of the same state (a reopened status watch) logs nothing.
     assert!(
       c.handle(

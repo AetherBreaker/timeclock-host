@@ -171,7 +171,10 @@ struct Mux {
   path: PathBuf,
   size: (u32, u32),
   writer: Option<Mp4Writer<BufWriter<File>>>,
+  /// Frames pushed, empty ones included: the next frame's time in 1/30 s, and the IDR cadence's count.
   count: u64,
+  /// Written at the next sample or at `finish`, so an empty frame can lengthen it and later frames keep their times.
+  pending: Option<Mp4Sample>,
 }
 
 impl Mux {
@@ -192,6 +195,10 @@ impl Mux {
       }
     }
     if sample.is_empty() {
+      if let Some(pending) = &mut self.pending {
+        pending.duration += 1;
+      }
+      self.count += 1;
       return Ok(());
     }
     let mp4_err = |e: mp4::Error| format!("{}: {e}", self.path.display());
@@ -230,15 +237,20 @@ impl Mux {
       is_sync: sync,
       bytes: Bytes::from(sample),
     };
-    let writer = self.writer.as_mut().expect("created above");
-    writer.write_sample(1, &sample).map_err(mp4_err)?;
+    if let Some(previous) = self.pending.replace(sample) {
+      let writer = self.writer.as_mut().expect("created above");
+      writer.write_sample(1, &previous).map_err(mp4_err)?;
+    }
     self.count += 1;
     Ok(())
   }
 
   fn finish(self) -> Result<(), String> {
     let path = self.path.display().to_string();
-    let mut writer = self.writer.ok_or_else(|| format!("{path}: no frames"))?;
+    let (Some(mut writer), Some(last)) = (self.writer, self.pending) else {
+      return Err(format!("{path}: no frames"));
+    };
+    writer.write_sample(1, &last).map_err(|e| format!("{path}: {e}"))?;
     writer.write_end().map_err(|e| format!("{path}: {e}"))?;
     let file = writer
       .into_writer()
@@ -287,6 +299,7 @@ pub fn run(dir: &Path, name: &str) -> Result<(), String> {
     size: (0, 0),
     writer: None,
     count: 0,
+    pending: None,
   };
   let (mut next, mut shown) = (0, None::<Frame>);
   for k in 0..=(end - t0) * FPS / 1_000_000 {
@@ -431,6 +444,7 @@ mod tests {
       size: (16, 16),
       writer: None,
       count: 0,
+      pending: None,
     };
     mux
       .push(&[
@@ -438,7 +452,10 @@ mod tests {
       ])
       .unwrap();
     mux.push(&[0, 0, 0, 1, 0x41, 7]).unwrap();
+    // An encode with no picture (only a delimiter): the previous frame stays up for it, and later ones keep their time.
+    mux.push(&[0, 0, 0, 1, 0x09, 0xf0]).unwrap();
     mux.push(&[0, 0, 0, 1, 0x41, 8]).unwrap();
+    assert_eq!(mux.count, 4);
     mux.finish().unwrap();
     let size = fs::metadata(&path).unwrap().len();
     let mut reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(File::open(&path).unwrap()), size).unwrap();
@@ -451,7 +468,8 @@ mod tests {
     assert_eq!(first.bytes.as_ref(), [0, 0, 0, 3, 0x65, 9, 9]);
     let second = reader.read_sample(1, 2).unwrap().unwrap();
     assert!(!second.is_sync);
-    assert_eq!(second.start_time, 1);
+    assert_eq!((second.start_time, second.duration), (1, 2));
+    assert_eq!(reader.read_sample(1, 3).unwrap().unwrap().start_time, 3);
     fs::remove_dir_all(dir).unwrap();
   }
 }

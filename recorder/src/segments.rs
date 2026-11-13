@@ -25,6 +25,14 @@ struct Current {
   frames: BufWriter<File>,
 }
 
+/// Segment `seq`'s `.h264` and `.frames` in `live_dir`.
+fn paths(live_dir: &Path, seq: u64) -> (PathBuf, PathBuf) {
+  (
+    live_dir.join(format!("{seq:010}.h264")),
+    live_dir.join(format!("{seq:010}.frames")),
+  )
+}
+
 pub struct Segments {
   dir: PathBuf,
   next_seq: u64,
@@ -33,13 +41,6 @@ pub struct Segments {
 }
 
 impl Segments {
-  fn paths(&self, seq: u64) -> (PathBuf, PathBuf) {
-    (
-      self.dir.join(format!("{seq:010}.h264")),
-      self.dir.join(format!("{seq:010}.frames")),
-    )
-  }
-
   /// Creates `live_dir` if needed and recovers crash leftovers: each `.frames` with at least one line becomes a
   /// finished segment (start/end = its first/last frame time); anything else (no frames, no `.h264`) is deleted.
   pub fn open(live_dir: PathBuf) -> io::Result<Self> {
@@ -65,7 +66,7 @@ impl Segments {
     }
     for seq in seqs {
       this.next_seq = seq + 1;
-      let (h264, frames) = this.paths(seq);
+      let (h264, frames) = paths(&this.dir, seq);
       // A crash between the two per-frame writes (or ENOSPC) can leave a torn last `.frames` line or h264 bytes with
       // no line. Keep only complete `<micros> <bytes>` lines whose bytes are all in the `.h264`, then cut both files
       // to exactly those, so frame lines and bytes stay aligned.
@@ -102,7 +103,7 @@ impl Segments {
   pub fn begin(&mut self, first_at: Micros) -> io::Result<()> {
     self.finish()?;
     let seq = self.next_seq;
-    let (h264, frames) = self.paths(seq);
+    let (h264, frames) = paths(&self.dir, seq);
     let create = |p: PathBuf| {
       OpenOptions::new()
         .create_new(true)
@@ -145,7 +146,7 @@ impl Segments {
     };
     cur.h264.flush()?;
     cur.frames.flush()?;
-    let (h264, frames) = self.paths(cur.info.seq);
+    let (h264, frames) = paths(&self.dir, cur.info.seq);
     if fs::metadata(&frames)?.len() == 0 {
       fs::remove_file(h264)?;
       fs::remove_file(frames)?;
@@ -179,15 +180,43 @@ impl Segments {
   pub fn prune(&mut self, older_than: Micros) -> io::Result<()> {
     let (old, keep): (Vec<SegmentInfo>, Vec<SegmentInfo>) = self.finished.iter().partition(|s| s.end < older_than);
     self.finished = keep;
-    self.delete(&old)
+    Taken {
+      dir: self.dir.clone(),
+      segments: old,
+    }
+    .delete()
   }
 
-  /// Deletes every listed segment's files even if one delete fails (NotFound is fine), then returns the first error.
-  /// Callers drop the segments from `finished` first, so a failure never leaves state a retry would trip on.
-  fn delete(&self, segments: &[SegmentInfo]) -> io::Result<()> {
+  /// Removes every finished segment with `start >= from` from the store, for a join done without holding it (the
+  /// writer keeps writing new segments meanwhile). The open segment is left alone: a closing clip `finish`es first.
+  pub fn take(&mut self, from: Micros) -> Taken {
+    let (take, keep): (Vec<SegmentInfo>, Vec<SegmentInfo>) = self.finished.iter().partition(|s| s.start >= from);
+    self.finished = keep;
+    Taken {
+      dir: self.dir.clone(),
+      segments: take,
+    }
+  }
+
+  /// `take(from).join(dir, name)`.
+  pub fn join(&mut self, from: Micros, dir: &Path, name: &str) -> io::Result<()> {
+    self.take(from).join(dir, name)
+  }
+}
+
+/// Segments taken out of the store, to be joined into a clip. If the join fails they stay in `live/`, untracked, and
+/// the next start's recovery makes them a clip.
+pub struct Taken {
+  dir: PathBuf,
+  segments: Vec<SegmentInfo>,
+}
+
+impl Taken {
+  /// Deletes every segment's files even if one delete fails (NotFound is fine), then returns the first error.
+  fn delete(&self) -> io::Result<()> {
     let mut first = Ok(());
-    for s in segments {
-      let (h264, frames) = self.paths(s.seq);
+    for s in &self.segments {
+      let (h264, frames) = paths(&self.dir, s.seq);
       for r in [remove_if_present(&h264), remove_if_present(&frames)] {
         first = first.and(r);
       }
@@ -195,20 +224,18 @@ impl Segments {
     first
   }
 
-  /// Writes every finished segment with `start >= from`, in order, as `<dir>/<name>.h264` and `.frames`, then deletes
-  /// the segments. Retry-safe: the clip is built in truncated `.part` files and renamed into place before any delete,
-  /// so a retry or a crash-and-recover rebuilds the same clip instead of appending a duplicate. Nothing to take
-  /// creates no files. A segment missing either file is skipped as a pair. The open segment is left alone: a closing
-  /// clip `finish`es first.
-  pub fn join(&mut self, from: Micros, dir: &Path, name: &str) -> io::Result<()> {
-    let (take, keep): (Vec<SegmentInfo>, Vec<SegmentInfo>) = self.finished.iter().partition(|s| s.start >= from);
-    if take.is_empty() {
+  /// Writes the segments, in order, as `<dir>/<name>.h264` and `.frames`, then deletes them. Retry-safe: the clip is
+  /// built in truncated `.part` files and renamed into place before any delete, so a crash-and-recover rebuilds the
+  /// same clip instead of appending a duplicate. Nothing to join creates no files. A segment missing either file is
+  /// skipped as a pair.
+  pub fn join(self, dir: &Path, name: &str) -> io::Result<()> {
+    if self.segments.is_empty() {
       return Ok(());
     }
     let part = |ext: &str| dir.join(format!("{name}.{ext}.part"));
     let (mut out_h264, mut out_frames) = (File::create(part("h264"))?, File::create(part("frames"))?);
-    for s in &take {
-      let (h264, frames) = self.paths(s.seq);
+    for s in &self.segments {
+      let (h264, frames) = paths(&self.dir, s.seq);
       match (File::open(&h264), File::open(&frames)) {
         (Ok(mut h), Ok(mut f)) => {
           io::copy(&mut h, &mut out_h264)?;
@@ -223,8 +250,7 @@ impl Segments {
     for ext in ["h264", "frames"] {
       fs::rename(part(ext), dir.join(format!("{name}.{ext}")))?;
     }
-    self.finished = keep;
-    self.delete(&take)
+    self.delete()
   }
 }
 
@@ -351,6 +377,22 @@ mod tests {
     drop(f);
     Segments::open(root.join("live")).unwrap();
     assert_eq!(fs::read(root.join("live/0000000003.h264")).unwrap(), b"fg");
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  /// The join runs outside the store's lock: a segment written meanwhile is neither joined nor disturbed.
+  #[test]
+  fn writing_carries_on_while_taken_segments_are_joined() {
+    let root = temp_dir("seg-take");
+    let mut s = three(&root);
+    let taken = s.take(2_000);
+    assert_eq!(s.finished().len(), 1);
+    segment(&mut s, &[(4_000, b'f')]);
+    taken.join(&root, "clip").unwrap();
+    assert_eq!(fs::read(root.join("clip.h264")).unwrap(), b"cde");
+    let left: Vec<_> = s.finished().iter().map(|i| i.start).collect();
+    assert_eq!(left, [1_000, 4_000]);
+    assert!(root.join("live/0000000003.h264").exists());
     fs::remove_dir_all(root).unwrap();
   }
 

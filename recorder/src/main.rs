@@ -16,6 +16,7 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, exit};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -39,6 +40,7 @@ const TICK: Duration = Duration::from_millis(250);
 const ALIVE_EVERY: Duration = Duration::from_secs(60);
 const STATUS_RETRY: Duration = Duration::from_secs(5);
 const INPUT_RESCAN: Duration = Duration::from_secs(2);
+const SWAY_DOWN: Duration = Duration::from_secs(30);
 
 /// Locks through poisoning: a panic aborts the process (release profile), so a poisoned lock is never seen live.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -109,7 +111,7 @@ struct Processing {
 }
 
 impl Processing {
-  /// Queues every clip with an `.h264` and `.frames` but no `.mp4`.
+  /// Queues every clip with an `.h264` and `.frames` but no `.mp4`, except the one being processed (no `.mp4` yet).
   fn scan(&mut self) {
     let Ok(entries) = fs::read_dir(&self.dir) else { return };
     for entry in entries.flatten() {
@@ -118,7 +120,8 @@ impl Processing {
         continue;
       };
       let has = |ext: &str| self.dir.join(format!("{name}.{ext}")).exists();
-      if has("frames") && !has("mp4") && !self.failed.contains(name) {
+      let running = self.running.as_ref().is_some_and(|(r, _)| r == name);
+      if has("frames") && !has("mp4") && !self.failed.contains(name) && !running {
         self.queue.insert(name.to_string());
       }
     }
@@ -141,7 +144,11 @@ impl Processing {
       }
       self.running = None;
     }
-    let Some(name) = self.queue.pop_first() else { return };
+    // Queued while it was being processed, or made since: done already.
+    let mp4 = |name: &String| self.dir.join(format!("{name}.mp4")).exists();
+    let Some(name) = std::iter::from_fn(|| self.queue.pop_first()).find(|n| !mp4(n)) else {
+      return;
+    };
     let exe = match std::env::current_exe() {
       Ok(exe) => exe,
       Err(e) => return eprintln!("processing {name}: {e}"),
@@ -239,24 +246,39 @@ fn capture_thread(
   }
 }
 
-fn writer_thread(
+/// The writer's encoder, as a trait so a test can stand in for OpenH264.
+trait FrameEncoder {
+  fn encode(&mut self, frame: &Frame, force_idr: bool) -> Result<Vec<u8>, String>;
+}
+
+impl FrameEncoder for H264Encoder {
+  fn encode(&mut self, frame: &Frame, force_idr: bool) -> Result<Vec<u8>, String> {
+    H264Encoder::encode(self, frame, force_idr)
+  }
+}
+
+fn writer_thread<E: FrameEncoder>(
   frames: Receiver<(u64, Frame)>,
   target: Arc<(Mutex<Target>, Condvar)>,
   segments: Arc<Mutex<Segments>>,
   keyframe: Micros,
+  new_encoder: impl Fn(u32, u32) -> Result<E, String>,
 ) {
-  let (mut encoder, mut size, mut seg_start) = (None::<H264Encoder>, (0, 0), 0);
+  let (mut encoder, mut size, mut seg_start) = (None::<E>, (0, 0), 0);
   let mut failing = false;
   for (generation, frame) in frames {
-    // Queued before the target changed: stale.
-    if lock(&target.0).generation != generation || frame.width < 2 || frame.height < 2 {
+    if frame.width < 2 || frame.height < 2 {
       continue;
     }
     // Held through the encode, so a controller rotate or join can't land between the IDR decision and the write.
     let mut segs = lock(&segments);
+    // Queued before the target changed: stale. Checked under the segments lock (the controller bumps the generation
+    // before it finishes the segment), so a stale frame can't begin a segment after a stop.
+    if lock(&target.0).generation != generation {
+      continue;
+    }
     if (frame.width, frame.height) != size {
-      encoder =
-        Some(H264Encoder::new(Path::new(OPENH264), frame.width, frame.height).unwrap_or_else(|e| fatal("encoder", e)));
+      encoder = Some(new_encoder(frame.width, frame.height).unwrap_or_else(|e| fatal("encoder", e)));
       size = (frame.width, frame.height);
       let _ = segs.finish(); // a new size starts a new segment; an error here resurfaces at `begin`
     }
@@ -356,30 +378,43 @@ fn status_thread(dir: PathBuf, mut watch: StatusWatch, msgs: Sender<Msg>) {
   }
 }
 
-fn sway_thread(socket: PathBuf, app_id: String, area: Arc<Mutex<(u32, u32)>>, msgs: Sender<Msg>) {
-  let mut failing = false;
+/// An IPC error isn't a window change, so it sends nothing and the last state stands. Errors lasting `SWAY_DOWN` clear
+/// `sway_ok`, which stops `recorder.json` (being connected to sway is part of working) until sway answers again.
+fn sway_thread(
+  socket: PathBuf,
+  app_id: String,
+  area: Arc<Mutex<(u32, u32)>>,
+  sway_ok: Arc<AtomicBool>,
+  msgs: Sender<Msg>,
+) {
+  let mut failing_since = None;
   loop {
-    let shown = match get_tree(&socket) {
+    match get_tree(&socket) {
       Ok(tree) => {
-        failing = false;
-        window_rect(&tree, &app_id).and_then(|(shown, rect)| {
+        if failing_since.take().is_some() {
+          eprintln!("sway answers again");
+        }
+        sway_ok.store(true, Ordering::Relaxed);
+        let shown = window_rect(&tree, &app_id).and_then(|(shown, rect)| {
           // Touches map onto the window even while it's hidden (a waking tap).
           *lock(&area) = (rect.width, rect.height);
           shown.then_some(rect)
-        })
+        });
+        let _ = msgs.send(Msg::Window {
+          at: now_micros(),
+          shown,
+        });
       }
       Err(e) => {
-        if !failing {
+        let since = *failing_since.get_or_insert_with(|| {
           eprintln!("sway: {e}");
-          failing = true;
+          Instant::now()
+        });
+        if since.elapsed() >= SWAY_DOWN && sway_ok.swap(false, Ordering::Relaxed) {
+          eprintln!("sway has failed for {} s: recorder.json stops", SWAY_DOWN.as_secs());
         }
-        None
       }
-    };
-    let _ = msgs.send(Msg::Window {
-      at: now_micros(),
-      shown,
-    });
+    }
     thread::sleep(TICK);
   }
 }
@@ -406,8 +441,12 @@ fn execute(
       }
       Action::Finish => lock(segments).finish(),
       Action::Join { from, name } => {
-        let mut segs = lock(segments);
-        segs.finish().and_then(|()| segs.join(*from, dir, name))
+        // Only the finish and the take hold the store; the copy and fsync run without it, so the writer carries on.
+        let taken = {
+          let mut segs = lock(segments);
+          segs.finish().map(|()| segs.take(*from))
+        };
+        taken.and_then(|taken| taken.join(dir, name))
       }
       Action::Prune(older_than) => lock(segments).prune(*older_than),
       Action::Text { name, at, line } => textlog::append(dir, name, *at, line),
@@ -467,14 +506,20 @@ fn live(cfg: Config) -> ! {
   let (t, m) = (target.clone(), msgs.clone());
   thread::spawn(move || capture_thread(capture, t, min_gap, m, frames_tx));
   let (t, s, keyframe) = (target.clone(), segments.clone(), cfg.keyframe);
-  thread::spawn(move || writer_thread(frames_rx, t, s, keyframe));
+  thread::spawn(move || {
+    writer_thread(frames_rx, t, s, keyframe, |w, h| {
+      H264Encoder::new(Path::new(OPENH264), w, h)
+    })
+  });
   let (a, m) = (area.clone(), msgs.clone());
   thread::spawn(move || input_thread(a, m));
   let asleep = watch.asleep_now();
   let (d, m) = (cfg.status_dir.clone(), msgs.clone());
   thread::spawn(move || status_thread(d, watch, m));
   let (socket, app_id, m) = (cfg.sway_socket.clone(), cfg.clock_app_id.clone(), msgs);
-  thread::spawn(move || sway_thread(socket, app_id, area, m));
+  let sway_ok = Arc::new(AtomicBool::new(true));
+  let ok = sway_ok.clone();
+  thread::spawn(move || sway_thread(socket, app_id, area, ok, m));
 
   let mut ctl = Controller::new(&cfg, asleep);
   let env = LiveEnv {
@@ -490,17 +535,22 @@ fn live(cfg: Config) -> ! {
     };
     let now = Instant::now();
     let tick = now >= next_tick;
+    let mut batch: Vec<Msg> = msg.into_iter().collect();
     if tick {
       next_tick = now + TICK;
+      // Everything already queued goes first: after a stall (a long join, the cap), beats sent meanwhile are waiting,
+      // and a tick ahead of them would see a stale `last_change` and report a freeze that never happened.
+      batch.extend(inbox.try_iter());
+      batch.push(Msg::Tick(now_micros()));
     }
-    for msg in msg.into_iter().chain(tick.then(|| Msg::Tick(now_micros()))) {
+    for msg in batch {
       let actions = ctl.handle(msg, &env);
       execute(actions, &cfg, ctl.open_clip(), &segments, &target, &mut processing);
     }
     if tick {
       processing.poll();
     }
-    if now >= next_alive {
+    if now >= next_alive && sway_ok.load(Ordering::Relaxed) {
       next_alive = now + ALIVE_EVERY;
       if let Err(e) = status::write_alive(&cfg.status_dir, now_micros(), ctl.open_clip().is_some()) {
         eprintln!("recorder.json: {e}");
@@ -653,5 +703,81 @@ mod tests {
     };
     p.scan();
     assert_eq!(p.queue.iter().collect::<Vec<_>>(), ["a"]);
+  }
+
+  /// The clip being processed has no `.mp4` yet, but a scan after a close must not queue it again; and a queued clip
+  /// whose `.mp4` appeared meanwhile is skipped when its turn comes.
+  #[test]
+  fn processing_never_runs_a_clip_twice() {
+    let (rec, _) = dirs("twice");
+    for name in ["a", "b"] {
+      for ext in ["h264", "frames"] {
+        fs::write(rec.join(format!("{name}.{ext}")), "").unwrap();
+      }
+    }
+    let mut p = Processing {
+      dir: rec.clone(),
+      queue: BTreeSet::new(),
+      running: Some(("a".into(), Command::new("true").spawn().unwrap())),
+      failed: HashSet::new(),
+    };
+    p.scan();
+    assert_eq!(p.queue.iter().collect::<Vec<_>>(), ["b"]);
+    if let Some((_, child)) = &mut p.running {
+      child.wait().unwrap();
+    }
+    fs::write(rec.join("b.mp4"), "").unwrap();
+    p.poll();
+    assert!(p.running.is_none() && p.queue.is_empty());
+  }
+
+  struct FakeEncoder;
+
+  impl FrameEncoder for FakeEncoder {
+    fn encode(&mut self, _: &Frame, _: bool) -> Result<Vec<u8>, String> {
+      Ok(vec![0, 0, 0, 1, 0x65])
+    }
+  }
+
+  /// A frame queued before a stop reaches the writer after the controller bumped the generation and finished the
+  /// segment: it's dropped, so no segment is left open across the stop (a waking tap's lead-in would start there).
+  #[test]
+  fn a_frame_queued_before_a_stop_never_begins_a_segment_after_it() {
+    let (rec, _) = dirs("writer");
+    let segments = Arc::new(Mutex::new(Segments::open(rec.join("live")).unwrap()));
+    let target = Arc::new((
+      Mutex::new(Target {
+        generation: 1,
+        rect: None,
+      }),
+      Condvar::new(),
+    ));
+    let (tx, rx) = mpsc::sync_channel(2);
+    let (t, s) = (target.clone(), segments.clone());
+    let writer = thread::spawn(move || writer_thread(rx, t, s, 2_000_000, |_, _| Ok(FakeEncoder)));
+    let frame = |at| Frame {
+      at,
+      width: 4,
+      height: 4,
+      bgrx: vec![0; 64],
+    };
+    {
+      // The controller's stop, run while the writer waits for the store with a generation-1 frame.
+      let mut segs = lock(&segments);
+      tx.send((1, frame(T0))).unwrap();
+      thread::sleep(Duration::from_millis(200));
+      lock(&target.0).generation = 2;
+      segs.finish().unwrap();
+    }
+    tx.send((2, frame(T0 + 1_000_000))).unwrap();
+    drop(tx);
+    writer.join().unwrap();
+    let segs = lock(&segments);
+    assert!(segs.finished().is_empty());
+    assert_eq!(
+      segs.start_for(Micros::MAX),
+      Some(T0 + 1_000_000),
+      "only the current frame began a segment"
+    );
   }
 }
