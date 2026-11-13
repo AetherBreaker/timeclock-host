@@ -12,7 +12,7 @@ const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
 const BTN_MISC: u16 = 0x100;
-const BTN_LEFT: u16 = 0x110;
+// Mouse buttons (`BTN_LEFT`..=`BTN_TASK`, 0x110..=0x117) all count as clicks.
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const ABS_MT_SLOT: u16 = 0x2f;
@@ -53,9 +53,9 @@ pub fn classify(props: &[u8], ev: &[u8], key: &[u8], abs: &[u8], rel: &[u8]) -> 
   let (has_key, has_abs, has_rel) = (has(ev, EV_KEY), has(ev, EV_ABS), has(ev, EV_REL));
   if has_abs && has(props, INPUT_PROP_DIRECT) && has(abs, ABS_MT_POSITION_X) {
     Kind::Touchscreen
-  } else if has_key && has_abs && has(abs, ABS_X) && has(key, BTN_LEFT) {
+  } else if has_key && has_abs && has(abs, ABS_X) && (0x110..=0x117).any(|b| has(key, b)) {
     Kind::AbsPointer
-  } else if has_key && has_rel && has(rel, 0) && has(key, BTN_LEFT) {
+  } else if has_key && has_rel && has(rel, 0) && (0x110..=0x117).any(|b| has(key, b)) {
     Kind::RelPointer
   } else if has_key && (0..BTN_MISC).any(|k| has(key, k)) {
     Kind::Keyboard
@@ -121,9 +121,9 @@ impl Decoder {
     match (self.kind, ev_type, code) {
       (Kind::Touchscreen, EV_ABS, ABS_MT_SLOT) => self.slot = usize::try_from(value).unwrap_or(SLOTS),
       (Kind::Touchscreen, EV_ABS, ABS_MT_TRACKING_ID) if self.slot < SLOTS => {
-        // A new id is a new contact; -1 is the lift. A contact's later moves carry no id.
+        // A new id is a new contact; -1 is the lift. The slot keeps its last position: the kernel drops MT axis
+        // events equal to the slot's previous value, so a re-tap at the same x or y never re-sends that axis.
         self.pending_touch[self.slot] = value >= 0;
-        self.raw[self.slot] = (None, None);
       }
       (Kind::Touchscreen, EV_ABS, ABS_MT_POSITION_X) if self.slot < SLOTS => self.raw[self.slot].0 = Some(value),
       (Kind::Touchscreen, EV_ABS, ABS_MT_POSITION_Y) if self.slot < SLOTS => self.raw[self.slot].1 = Some(value),
@@ -141,7 +141,7 @@ impl Decoder {
         self.raw[0].1 = Some(value);
         self.moved = true;
       }
-      (Kind::AbsPointer, EV_KEY, BTN_LEFT) if value == 1 => self.pending_click = true,
+      (Kind::AbsPointer, EV_KEY, 0x110..=0x117) if value == 1 => self.pending_click = true,
       (Kind::AbsPointer, EV_SYN, 0) => {
         let click = std::mem::take(&mut self.pending_click);
         let moved = std::mem::take(&mut self.moved);
@@ -154,7 +154,7 @@ impl Decoder {
         return moved.then_some(InputEvent::Motion { at });
       }
       (Kind::RelPointer, EV_REL, _) => return Some(InputEvent::Motion { at }),
-      (Kind::RelPointer, EV_KEY, BTN_LEFT) if value == 1 => return Some(InputEvent::Click { at, pos: None }),
+      (Kind::RelPointer, EV_KEY, 0x110..=0x117) if value == 1 => return Some(InputEvent::Click { at, pos: None }),
       (Kind::Keyboard, EV_KEY, _) if value == 1 => return Some(InputEvent::Key { at }),
       _ => {}
     }
@@ -272,7 +272,17 @@ impl Inputs {
               let ev_type = u16::from_ne_bytes([ev[16], ev[17]]);
               let code = u16::from_ne_bytes([ev[18], ev[19]]);
               let value = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
-              out.extend(d.decoder.feed(secs * 1_000_000 + usecs, ev_type, code, value));
+              let at = secs * 1_000_000 + usecs;
+              // A SYN_REPORT can complete several interactions (fingers landing together): drain it fully.
+              let mut next = d.decoder.feed(at, ev_type, code, value);
+              while let Some(e) = next {
+                out.push(e);
+                next = if ev_type == EV_SYN {
+                  d.decoder.feed(at, ev_type, code, value)
+                } else {
+                  None
+                };
+              }
             }
           }
           Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
@@ -332,8 +342,50 @@ mod tests {
 
   fn frame(d: &mut Decoder, evs: &[(u16, u16, i32)]) -> Vec<InputEvent> {
     let mut out: Vec<_> = evs.iter().filter_map(|&(t, c, v)| d.feed(5, t, c, v)).collect();
-    out.extend(d.feed(5, 0, 0, 0));
+    // Like `Inputs::drain`: one SYN_REPORT is fed until it has yielded every interaction.
+    while let Some(e) = d.feed(5, 0, 0, 0) {
+      out.push(e);
+    }
     out
+  }
+
+  #[test]
+  fn every_mouse_button_clicks() {
+    let mut d = Decoder::new(Kind::RelPointer, (0, 0), (0, 0));
+    assert_eq!(d.feed(1, 1, 0x111, 1), Some(InputEvent::Click { at: 1, pos: None }));
+    let none = bits(&[]);
+    assert_eq!(
+      classify(&none, &bits(&[1, 2]), &bits(&[0x111]), &none, &bits(&[0])),
+      Kind::RelPointer
+    );
+  }
+
+  #[test]
+  fn retap_at_the_same_x_is_still_a_touch() {
+    let mut d = touch_decoder();
+    frame(&mut d, &[(ABS, 0x39, 7), (ABS, 0x35, 2048), (ABS, 0x36, 1024)]);
+    frame(&mut d, &[(ABS, 0x39, -1)]);
+    // The kernel drops the unchanged X, so only Y arrives.
+    let got = frame(&mut d, &[(ABS, 0x39, 8), (ABS, 0x36, 512)]);
+    assert_eq!(got, vec![InputEvent::Touch { at: 5, x: 683, y: 96 }]);
+  }
+
+  #[test]
+  fn contacts_landing_in_one_frame_all_report() {
+    let mut d = touch_decoder();
+    let evs = [
+      (ABS, 0x2f, 0),
+      (ABS, 0x39, 7),
+      (ABS, 0x35, 0),
+      (ABS, 0x36, 0),
+      (ABS, 0x2f, 1),
+      (ABS, 0x39, 8),
+      (ABS, 0x35, 4095),
+      (ABS, 0x36, 4095),
+    ];
+    let got = frame(&mut d, &evs);
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|e| matches!(e, InputEvent::Touch { at: 5, .. })));
   }
 
   #[test]
