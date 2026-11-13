@@ -12,7 +12,8 @@ use crate::capture::Frame;
 /// Fedora's OpenH264 2.6.0, on every clock.
 pub const OPENH264: &str = "/usr/lib64/libopenh264.so.8";
 
-/// Fixed quantizer: text stays readable at a modest size. Task 9 tunes it on the device.
+/// Fixed quantizer, so text stays readable at a modest size. With rate control off, OpenH264
+/// may take an IDR's QP from its per-layer default (`iDLayerQp`) instead; the crate (0.9) doesn't expose that setting.
 const QP: u8 = 26;
 
 /// Loads `lib`, refusing any version but 2.6.x: the crate's bindings match 2.6's ABI, and a mismatch is UB, not an error.
@@ -59,6 +60,9 @@ impl H264Encoder {
       .rate_control_mode(RateControlMode::Off)
       .qp(QpRange::new(QP, QP))
       .skip_frames(false)
+      // Both are rate-control aids: off, as unused with rate control off, and OpenH264 warns about each otherwise.
+      .adaptive_quantization(false)
+      .background_detection(false)
       // Keyframes only where `force_idr` asks (segment starts).
       .intra_frame_period(IntraFramePeriod::auto());
     let encoder = Encoder::with_api_config(load(lib)?, config).map_err(|e| e.to_string())?;

@@ -241,9 +241,11 @@ impl Capture {
     let x1 = (i64::from(rect.x) + i64::from(rect.width)).clamp(0, i64::from(width)) as u32;
     let y1 = (i64::from(rect.y) + i64::from(rect.height)).clamp(0, i64::from(height)) as u32;
     if x1 <= x0 || y1 <= y0 {
-      return Err(io::Error::other(format!(
-        "the window rect {rect:?} is off the {width}x{height} screen"
-      )));
+      // `InvalidInput`: a sway state (an empty or off-screen window), not a capture failure; the caller waits it out.
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("the window rect {rect:?} is off the {width}x{height} screen"),
+      ));
     }
     let (w, h) = (x1 - x0, y1 - y0);
     // One read of the rows the rect spans (mirrored when the buffer is stored bottom-up), then the columns are cut.

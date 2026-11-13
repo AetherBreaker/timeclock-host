@@ -44,6 +44,9 @@ pub struct Overlay {
   pub touches: Vec<(Micros, i32, i32)>,
   /// Start and end; `None` runs to the clip's end.
   pub freezes: Vec<(Micros, Option<Micros>)>,
+  /// The first `clip start` line. The footage can begin well before it: a static screen's hours-old segment, or a
+  /// split's re-keyed frame.
+  pub start: Option<Micros>,
   /// The `clip end` line. A frozen screen sends no frames, so the footage can stop well before it.
   pub end: Option<Micros>,
 }
@@ -70,11 +73,27 @@ impl Overlay {
             open.1 = Some(at);
           }
         }
+        ["clip", "start"] => {
+          o.start.get_or_insert(at);
+        }
         ["clip", "end"] => o.end = Some(at),
         _ => {}
       }
     }
     o
+  }
+
+  /// The video's first and last output times, for footage whose frames run from `first` to `last`. It starts at
+  /// `clip start` (showing the frame on screen then) and runs to `clip end`. Stamps read back through `mktime` can be
+  /// an hour off in the fall-back hour, so the end is held within `max_clip` and a minute of the start (no clip is
+  /// longer), and a start past the end falls back to the first frame.
+  pub fn span(&self, first: Micros, last: Micros, max_clip: Micros) -> (Micros, Micros) {
+    let start = self.start.map_or(first, |s| s.max(first));
+    let end = self
+      .end
+      .map_or(last, |e| e.max(last))
+      .min(start + max_clip + 60_000_000);
+    if start <= end { (start, end) } else { (first, end) }
   }
 }
 
@@ -260,8 +279,9 @@ impl Mux {
   }
 }
 
-/// Makes `<dir>/<name>.mp4` from the clip's `.h264`, `.frames` and `.txt`, through `.mp4.part`.
-pub fn run(dir: &Path, name: &str) -> Result<(), String> {
+/// Makes `<dir>/<name>.mp4` from the clip's `.h264`, `.frames` and `.txt`, through `.mp4.part`. `max_clip` bounds its
+/// length (`Overlay::span`).
+pub fn run(dir: &Path, name: &str, max_clip: Micros) -> Result<(), String> {
   let path = |ext: &str| dir.join(format!("{name}.{ext}"));
   let h264 = fs::read(path("h264")).map_err(|e| format!("{name}.h264: {e}"))?;
   let index = fs::read_to_string(path("frames")).map_err(|e| format!("{name}.frames: {e}"))?;
@@ -284,9 +304,8 @@ pub fn run(dir: &Path, name: &str) -> Result<(), String> {
   let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
     return Err(format!("{name}: no frames"));
   };
-  let (t0, last) = (first.0, last.0);
   let overlay = fs::read_to_string(path("txt")).map_or_else(|_| Overlay::default(), |t| Overlay::parse(&t));
-  let end = overlay.end.map_or(last, |e| e.max(last));
+  let (t0, end) = overlay.span(first.0, last.0, max_clip);
   let font = fs::read(FONT).ok().and_then(|b| FontVec::try_from_vec(b).ok());
   if font.is_none() {
     eprintln!("{FONT} is missing: {name}.mp4 gets no times or timer");
@@ -360,9 +379,48 @@ mod tests {
       Overlay {
         touches: vec![(base + 1_000_000, 10, 20), (base + 1_500_000, 30, 40)],
         freezes: vec![(base + 2_000_000, Some(base + 5_250_000)), (base + 6_000_000, None)],
+        start: Some(base),
         end: Some(base + 9_000_000),
       }
     );
+  }
+
+  #[test]
+  fn span_starts_at_clip_start_and_bounds_the_end() {
+    const S: Micros = 1_000_000;
+    const MAX: Micros = 600 * S;
+    let o = |start, end| Overlay {
+      start,
+      end,
+      ..Overlay::default()
+    };
+    // A normal clip: frames from its start, ending after the last frame (a frozen tail).
+    assert_eq!(
+      o(Some(100 * S), Some(200 * S)).span(100 * S, 150 * S, MAX),
+      (100 * S, 200 * S)
+    );
+    // A split during a freeze: one re-keyed frame from long before the clip; the video still covers the clip.
+    assert_eq!(
+      o(Some(5_000 * S), Some(5_600 * S)).span(1_000 * S, 1_000 * S, MAX),
+      (5_000 * S, 5_600 * S)
+    );
+    // A static screen's hours-old segment: the video starts at `clip start`, not the first frame.
+    assert_eq!(
+      o(Some(7_183 * S), Some(7_215 * S)).span(0, 7_210 * S, MAX),
+      (7_183 * S, 7_215 * S)
+    );
+    // The fall-back hour: an end read an hour late is held within max_clip and a minute.
+    assert_eq!(
+      o(Some(100 * S), Some(3_800 * S)).span(100 * S, 150 * S, MAX),
+      (100 * S, 760 * S)
+    );
+    // A start read an hour late falls back to the first frame.
+    assert_eq!(
+      o(Some(3_700 * S), Some(200 * S)).span(100 * S, 150 * S, MAX),
+      (100 * S, 200 * S)
+    );
+    // No `.txt`: the frames alone.
+    assert_eq!(Overlay::default().span(100 * S, 150 * S, MAX), (100 * S, 150 * S));
   }
 
   #[test]

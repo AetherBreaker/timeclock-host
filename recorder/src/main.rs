@@ -5,11 +5,11 @@
 //! - capture: blocks in `Capture::next` until the screen changes; sends each frame's heartbeat to the controller and
 //!   the frame to the writer through a 2-deep channel (full: the frame is dropped).
 //! - writer: encodes and appends to the live segments, rotating at every `keyframe` with a forced IDR.
-//! - input, status (inotify), sway (GET_TREE every 250 ms): readers.
+//! - input, status (inotify), sway (GET_TREE every 250 ms), signal (SIGTERM, SIGINT): readers.
 //! - controller (main thread): owns the clip state (`control::Controller`), the status files and the processing child,
 //!   and ticks every 250 ms whatever the others are doing.
 //!
-//! `Segments` sits behind a mutex shared by the writer (per frame) and the controller (start, join, prune).
+//! `Store` (the segments and the encoder) sits behind a mutex shared by the writer and the controller.
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
@@ -179,14 +179,75 @@ impl Processing {
   }
 }
 
-struct LiveEnv<'a> {
-  segments: &'a Mutex<Segments>,
+/// The writer's encoder, as a trait so a test can stand in for OpenH264.
+trait FrameEncoder {
+  fn encode(&mut self, frame: &Frame, force_idr: bool) -> Result<Vec<u8>, String>;
+}
+
+impl FrameEncoder for H264Encoder {
+  fn encode(&mut self, frame: &Frame, force_idr: bool) -> Result<Vec<u8>, String> {
+    H264Encoder::encode(self, frame, force_idr)
+  }
+}
+
+/// The live segments and the writer's encoder state, under one mutex: the writer holds it per frame, the controller
+/// for a lead-in, a join (with a split's re-key) or a prune.
+struct Store<E> {
+  segments: Segments,
+  encoder: Option<E>,
+  /// The encoder's frame size.
+  size: (u32, u32),
+  seg_start: Micros,
+  /// The last frame written and its capture generation, moved here (not copied) for `rekey`.
+  last: Option<(u64, Frame)>,
+}
+
+impl<E: FrameEncoder> Store<E> {
+  fn new(segments: Segments) -> Self {
+    Self {
+      segments,
+      encoder: None,
+      size: (0, 0),
+      seg_start: 0,
+      last: None,
+    }
+  }
+
+  /// No frames come while the screen is frozen, so a split's next clip would have no video. This starts a fresh
+  /// segment with the last frame again, as a keyframe at its real capture time (the strip shows when that picture was
+  /// taken), for the next clip's join to take. Skipped when that frame is from an older capture: the window has gone.
+  fn rekey(&mut self, generation: u64) -> io::Result<()> {
+    let Self {
+      segments,
+      encoder,
+      seg_start,
+      last,
+      ..
+    } = self;
+    let (Some((from, frame)), Some(encoder)) = (last.as_ref(), encoder.as_mut()) else {
+      return Ok(());
+    };
+    if *from != generation {
+      return Ok(());
+    }
+    segments.begin(frame.at)?;
+    *seg_start = frame.at;
+    let bits = encoder.encode(frame, true).unwrap_or_else(|e| fatal("encoder", e));
+    // A failed write leaves the encoder ahead of the file: finish, so the next frame starts afresh with an IDR.
+    segments.write(frame.at, &bits).inspect_err(|_| {
+      let _ = segments.finish();
+    })
+  }
+}
+
+struct LiveEnv<'a, E> {
+  store: &'a Mutex<Store<E>>,
   dir: &'a Path,
 }
 
-impl Env for LiveEnv<'_> {
+impl<E: FrameEncoder> Env for LiveEnv<'_, E> {
   fn start_for(&self, t: Micros) -> Option<Micros> {
-    lock(self.segments).start_for(t)
+    lock(self.store).segments.start_for(t)
   }
   fn unique_name(&self, at: Micros) -> String {
     unique_clip_name(self.dir, at)
@@ -227,7 +288,19 @@ fn capture_thread(
         t = wake.wait(t).unwrap_or_else(PoisonError::into_inner);
       }
     };
-    let frame = capture.next(rect, min_gap).unwrap_or_else(|e| fatal("capture", e));
+    let frame = match capture.next(rect, min_gap) {
+      Ok(frame) => frame,
+      // An empty or off-screen window is a sway state, not a failure: wait for the controller's next target.
+      Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+        eprintln!("capture: {e}; waiting for the window to change");
+        let mut t = lock(state);
+        while t.generation == generation {
+          t = wake.wait(t).unwrap_or_else(PoisonError::into_inner);
+        }
+        continue;
+      }
+      Err(e) => fatal("capture", e),
+    };
     // The target changed while this waited: the rect is stale, and the picture may be the standby.
     if lock(state).generation != generation {
       continue;
@@ -246,45 +319,40 @@ fn capture_thread(
   }
 }
 
-/// The writer's encoder, as a trait so a test can stand in for OpenH264.
-trait FrameEncoder {
-  fn encode(&mut self, frame: &Frame, force_idr: bool) -> Result<Vec<u8>, String>;
-}
-
-impl FrameEncoder for H264Encoder {
-  fn encode(&mut self, frame: &Frame, force_idr: bool) -> Result<Vec<u8>, String> {
-    H264Encoder::encode(self, frame, force_idr)
-  }
-}
-
 fn writer_thread<E: FrameEncoder>(
   frames: Receiver<(u64, Frame)>,
   target: Arc<(Mutex<Target>, Condvar)>,
-  segments: Arc<Mutex<Segments>>,
+  store: Arc<Mutex<Store<E>>>,
   keyframe: Micros,
   new_encoder: impl Fn(u32, u32) -> Result<E, String>,
 ) {
-  let (mut encoder, mut size, mut seg_start) = (None::<E>, (0, 0), 0);
   let mut failing = false;
   for (generation, frame) in frames {
     if frame.width < 2 || frame.height < 2 {
       continue;
     }
     // Held through the encode, so a controller rotate or join can't land between the IDR decision and the write.
-    let mut segs = lock(&segments);
-    // Queued before the target changed: stale. Checked under the segments lock (the controller bumps the generation
+    let mut store = lock(&store);
+    // Queued before the target changed: stale. Checked under the store's lock (the controller bumps the generation
     // before it finishes the segment), so a stale frame can't begin a segment after a stop.
     if lock(&target.0).generation != generation {
       continue;
     }
-    if (frame.width, frame.height) != size {
-      encoder = Some(new_encoder(frame.width, frame.height).unwrap_or_else(|e| fatal("encoder", e)));
-      size = (frame.width, frame.height);
-      let _ = segs.finish(); // a new size starts a new segment; an error here resurfaces at `begin`
+    let Store {
+      segments,
+      encoder,
+      size,
+      seg_start,
+      last,
+    } = &mut *store;
+    if (frame.width, frame.height) != *size {
+      *encoder = Some(new_encoder(frame.width, frame.height).unwrap_or_else(|e| fatal("encoder", e)));
+      *size = (frame.width, frame.height);
+      let _ = segments.finish(); // a new size starts a new segment; an error here resurfaces at `begin`
     }
-    let idr = !segs.writing() || frame.at - seg_start >= keyframe;
+    let idr = !segments.writing() || frame.at - *seg_start >= keyframe;
     if idr {
-      if let Err(e) = segs.begin(frame.at) {
+      if let Err(e) = segments.begin(frame.at) {
         // Nothing is encoded without a segment to hold it, so the encoder's next frame still follows on the last.
         if !failing {
           eprintln!("segment: {e}");
@@ -292,26 +360,36 @@ fn writer_thread<E: FrameEncoder>(
         }
         continue;
       }
-      seg_start = frame.at;
+      *seg_start = frame.at;
     }
     let encoder = encoder.as_mut().expect("built above for this size");
     let bits = encoder.encode(&frame, idr).unwrap_or_else(|e| fatal("encoder", e));
-    match segs.write(frame.at, &bits) {
-      Ok(()) if failing => {
-        eprintln!("segment writes work again");
-        failing = false;
+    match segments.write(frame.at, &bits) {
+      Ok(()) => {
+        if failing {
+          eprintln!("segment writes work again");
+          failing = false;
+        }
+        *last = Some((generation, frame));
       }
-      Ok(()) => {}
       Err(e) => {
         if !failing {
           eprintln!("segment: {e}");
           failing = true;
         }
         // The lost frame breaks the chain of references: the next frame starts a fresh segment with an IDR.
-        let _ = segs.finish();
+        let _ = segments.finish();
       }
     }
   }
+}
+
+/// Waits for SIGTERM or SIGINT (blocked in every thread, so only this one takes them) and tells the controller.
+fn signal_thread(signals: libc::sigset_t, msgs: Sender<Msg>) {
+  let mut signal = 0;
+  // SAFETY: `signals` is an initialized set and `signal` a valid out-pointer.
+  unsafe { libc::sigwait(&signals, &mut signal) };
+  let _ = msgs.send(Msg::Stop(now_micros()));
 }
 
 fn input_thread(area: Arc<Mutex<(u32, u32)>>, msgs: Sender<Msg>) {
@@ -420,11 +498,11 @@ fn sway_thread(
 }
 
 /// Carries out the controller's actions in order. I/O errors are logged and the loop carries on.
-fn execute(
+fn execute<E: FrameEncoder>(
   actions: Vec<Action>,
   cfg: &Config,
   open: Option<&str>,
-  segments: &Mutex<Segments>,
+  store: &Mutex<Store<E>>,
   target: &(Mutex<Target>, Condvar),
   processing: &mut Processing,
 ) {
@@ -439,21 +517,26 @@ fn execute(
         target.1.notify_all();
         Ok(())
       }
-      Action::Finish => lock(segments).finish(),
-      Action::Join { from, name } => {
-        // Only the finish and the take hold the store; the copy and fsync run without it, so the writer carries on.
+      Action::Finish => lock(store).segments.finish(),
+      Action::Join { from, name, rekey } => {
+        // Only the finish, the take and a re-key hold the store; the copy and fsync run without it, so the writer
+        // carries on. The re-key goes in the same hold, so its segment is the first after the take.
         let taken = {
-          let mut segs = lock(segments);
-          segs.finish().map(|()| segs.take(*from))
+          let mut store = lock(store);
+          let taken = store.segments.finish().map(|()| store.segments.take(*from));
+          if *rekey && let Err(e) = store.rekey(lock(&target.0).generation) {
+            eprintln!("re-key after the split: {e}");
+          }
+          taken
         };
         taken.and_then(|taken| {
           taken.join(dir, name).map_err(|(e, back)| {
-            lock(segments).give_back(back);
+            lock(store).segments.give_back(back);
             e
           })
         })
       }
-      Action::Prune(older_than) => lock(segments).prune(*older_than),
+      Action::Prune(older_than) => lock(store).segments.prune(*older_than),
       Action::Text { name, at, line } => textlog::append(dir, name, *at, line),
       Action::Recording(name) => status::set_recording(&cfg.status_dir, name.as_deref()),
       Action::Log(line) => {
@@ -501,7 +584,18 @@ fn live(cfg: Config) -> ! {
     fatal("encoder", e);
   }
   let segments = Segments::open(cfg.recordings_dir.join("live")).unwrap_or_else(|e| fatal("segments", e));
-  let segments = Arc::new(Mutex::new(segments));
+  let store = Arc::new(Mutex::new(Store::<H264Encoder>::new(segments)));
+  // Blocked before any thread starts, so every thread inherits the mask and only `signal_thread` takes them. Child
+  // processes get a clear mask from `Command`. Until here, the default action ends the process with no clip open.
+  // SAFETY: `signals` is initialized by `sigemptyset` before use.
+  let signals = unsafe {
+    let mut signals: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut signals);
+    libc::sigaddset(&mut signals, libc::SIGTERM);
+    libc::sigaddset(&mut signals, libc::SIGINT);
+    libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut());
+    signals
+  };
   let target = Arc::new((Mutex::new(Target::default()), Condvar::new()));
   let area = Arc::new(Mutex::new((0, 0)));
   let (msgs, inbox) = mpsc::channel();
@@ -510,7 +604,9 @@ fn live(cfg: Config) -> ! {
   let min_gap = Duration::from_secs(1) / cfg.max_fps.max(1);
   let (t, m) = (target.clone(), msgs.clone());
   thread::spawn(move || capture_thread(capture, t, min_gap, m, frames_tx));
-  let (t, s, keyframe) = (target.clone(), segments.clone(), cfg.keyframe);
+  let m = msgs.clone();
+  thread::spawn(move || signal_thread(signals, m));
+  let (t, s, keyframe) = (target.clone(), store.clone(), cfg.keyframe);
   thread::spawn(move || {
     writer_thread(frames_rx, t, s, keyframe, |w, h| {
       H264Encoder::new(Path::new(OPENH264), w, h)
@@ -528,10 +624,12 @@ fn live(cfg: Config) -> ! {
 
   let mut ctl = Controller::new(&cfg, asleep);
   let env = LiveEnv {
-    segments: &segments,
+    store: &store,
     dir: &cfg.recordings_dir,
   };
-  let (mut next_tick, mut next_alive) = (Instant::now(), Instant::now());
+  // The first report waits a full interval, so a recorder in a restart loop (dying on its first capture or encode)
+  // never refreshes `recorder.json` and the app alerts.
+  let (mut next_tick, mut next_alive) = (Instant::now(), Instant::now() + ALIVE_EVERY);
   loop {
     let msg = match inbox.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
       Ok(msg) => Some(msg),
@@ -550,7 +648,16 @@ fn live(cfg: Config) -> ! {
     }
     for msg in batch {
       let actions = ctl.handle(msg, &env);
-      execute(actions, &cfg, ctl.open_clip(), &segments, &target, &mut processing);
+      execute(actions, &cfg, ctl.open_clip(), &store, &target, &mut processing);
+      if let Msg::Stop(_) = msg {
+        // A half-made `.mp4.part` is deleted and redone at the next start.
+        if let Some((_, child)) = &mut processing.running {
+          let _ = child.kill();
+          let _ = child.wait();
+        }
+        eprintln!("stopped");
+        exit(0);
+      }
     }
     if tick {
       processing.poll();
@@ -570,13 +677,18 @@ fn main() {
       eprintln!("{CONFIG}: {e}; using the defaults");
       Config::default()
     }),
-    Err(_) => Config::default(),
+    Err(e) => {
+      if e.kind() != io::ErrorKind::NotFound {
+        eprintln!("{CONFIG}: {e}; using the defaults");
+      }
+      Config::default()
+    }
   };
   let args: Vec<String> = std::env::args().skip(1).collect();
   match &args[..] {
     [] => live(cfg),
     [cmd, dir, name] if cmd == "process" => {
-      if let Err(e) = process::run(Path::new(dir), name) {
+      if let Err(e) = process::run(Path::new(dir), name, cfg.max_clip) {
         fatal(&format!("processing {name}"), e);
       }
     }
@@ -746,10 +858,21 @@ mod tests {
 
   /// A frame queued before a stop reaches the writer after the controller bumped the generation and finished the
   /// segment: it's dropped, so no segment is left open across the stop (a waking tap's lead-in would start there).
+  fn frame(at: Micros) -> Frame {
+    Frame {
+      at,
+      width: 4,
+      height: 4,
+      bgrx: vec![0; 64],
+    }
+  }
+
   #[test]
   fn a_frame_queued_before_a_stop_never_begins_a_segment_after_it() {
     let (rec, _) = dirs("writer");
-    let segments = Arc::new(Mutex::new(Segments::open(rec.join("live")).unwrap()));
+    let store = Arc::new(Mutex::new(Store::<FakeEncoder>::new(
+      Segments::open(rec.join("live")).unwrap(),
+    )));
     let target = Arc::new((
       Mutex::new(Target {
         generation: 1,
@@ -758,31 +881,55 @@ mod tests {
       Condvar::new(),
     ));
     let (tx, rx) = mpsc::sync_channel(2);
-    let (t, s) = (target.clone(), segments.clone());
+    let (t, s) = (target.clone(), store.clone());
     let writer = thread::spawn(move || writer_thread(rx, t, s, 2_000_000, |_, _| Ok(FakeEncoder)));
-    let frame = |at| Frame {
-      at,
-      width: 4,
-      height: 4,
-      bgrx: vec![0; 64],
-    };
     {
       // The controller's stop, run while the writer waits for the store with a generation-1 frame.
-      let mut segs = lock(&segments);
+      let mut held = lock(&store);
       tx.send((1, frame(T0))).unwrap();
       thread::sleep(Duration::from_millis(200));
       lock(&target.0).generation = 2;
-      segs.finish().unwrap();
+      held.segments.finish().unwrap();
     }
     tx.send((2, frame(T0 + 1_000_000))).unwrap();
     drop(tx);
     writer.join().unwrap();
-    let segs = lock(&segments);
+    let store = lock(&store);
+    assert_eq!(store.last.as_ref().map(|(g, f)| (*g, f.at)), Some((2, T0 + 1_000_000)));
+    let segs = &store.segments;
     assert!(segs.finished().is_empty());
     assert_eq!(
       segs.start_for(Micros::MAX),
       Some(T0 + 1_000_000),
       "only the current frame began a segment"
     );
+  }
+
+  /// A split during a frozen screen: no new frames come, so the next clip's only footage is the last frame, re-keyed
+  /// into a fresh segment at its real capture time, which the next clip's join (from the split clip's start) takes.
+  #[test]
+  fn a_split_rekeys_the_last_frame_into_the_next_clip() {
+    let (rec, _) = dirs("rekey");
+    let from = T0 - 10_000_000;
+    let mut store = Store::new(Segments::open(rec.join("live")).unwrap());
+    store.encoder = Some(FakeEncoder);
+    store.last = Some((3, frame(T0)));
+    store.segments.begin(from).unwrap();
+    store.segments.write(from, b"old").unwrap();
+    // The split clip's join: finish and take.
+    store.segments.finish().unwrap();
+    store.segments.take(from).join(&rec, "split").unwrap();
+    // A frame from an older capture (the window has gone) is never re-keyed.
+    store.rekey(2).unwrap();
+    assert!(!store.segments.writing());
+    store.rekey(3).unwrap();
+    assert!(store.segments.writing());
+    store.segments.finish().unwrap();
+    store.segments.join(from, &rec, "next").unwrap();
+    assert_eq!(
+      fs::read_to_string(rec.join("next.frames")).unwrap(),
+      format!("{T0} 5\n")
+    );
+    assert_eq!(fs::read(rec.join("next.h264")).unwrap(), [0, 0, 0, 1, 0x65]);
   }
 }

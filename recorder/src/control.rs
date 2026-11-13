@@ -32,6 +32,8 @@ pub enum Msg {
     at: Micros,
     beat: u32,
   },
+  /// SIGTERM: close the open clip properly, then the process exits.
+  Stop(Micros),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,10 +45,13 @@ pub enum Action {
   },
   /// Finish the segment being written (capture stopped).
   Finish,
-  /// Finish the segment being written, then join every segment from `from` on into clip `name`.
+  /// Finish the segment being written, then join every segment from `from` on into clip `name`. With `rekey` (a
+  /// split), the last frame written then starts a fresh segment again as a keyframe, in the same hold of the store as
+  /// the take, so the next clip's video opens on the picture on screen even if the screen never changes again.
   Join {
     from: Micros,
     name: String,
+    rekey: bool,
   },
   /// Delete segments that ended before this.
   Prune(Micros),
@@ -171,6 +176,13 @@ impl Controller {
         at
       }
       Msg::Scan(at) => self.event(at, "scan".into(), true, env, &mut out),
+      Msg::Stop(at) => {
+        // Joined and ended like any close, so `recording` goes (recovery relies on it only after a crash). Processing
+        // and the cap are left to the next start: the process is about to exit.
+        self.close(at, None, &mut out);
+        out.retain(|a| !matches!(a, Action::Closed(_)));
+        return out;
+      }
       Msg::Beat { generation, at, beat } => {
         if generation == self.generation {
           match self.freeze.on_frame(at, beat) {
@@ -224,8 +236,11 @@ impl Controller {
   fn event(&mut self, at: Micros, line: String, interaction: bool, env: &dyn Env, out: &mut Vec<Action>) -> Micros {
     let opened = interaction && self.clips.interaction(at).is_some();
     if opened {
-      // The last segment start at or before the lead-in; none yet (capture just resumed) starts at `at`.
-      let start = env.start_for(at - self.before).map_or(at, |s| s.min(at));
+      // The join takes from the last segment start at or before the lead-in; none yet (capture just resumed) starts at
+      // `at`. A static screen sends no frames, so that segment can start hours back: the clip's name, `clip start`
+      // (where its video starts) and `max_clip` count from at most `before + keyframe` back.
+      let from = env.start_for(at - self.before).map_or(at, |s| s.min(at));
+      let start = from.max(at - self.before - self.keyframe);
       let name = env.unique_name(start);
       self.clips.opened(start);
       out.push(Action::Recording(Some(name.clone())));
@@ -235,7 +250,7 @@ impl Controller {
       }
       self.text(&name, at, &line, out);
       out.push(Action::Log(format!("clip {} started", self.dir.join(&name).display())));
-      self.clip = Some((name, start));
+      self.clip = Some((name, from));
     } else if let Some((name, _)) = &self.clip {
       self.text(name, at, &line, out);
     } else {
@@ -266,6 +281,7 @@ impl Controller {
     out.push(Action::Join {
       from,
       name: name.clone(),
+      rekey: next.is_some(),
     });
     if let Some(next) = next {
       self.text(&name, now, &format!("continues in {next}"), out);
@@ -406,7 +422,8 @@ mod tests {
       [
         Action::Join {
           from: 24 * S,
-          name: "c1".into()
+          name: "c1".into(),
+          rekey: false,
         },
         text("c1", 65 * S, "clip end"),
         Action::Recording(None),
@@ -563,7 +580,8 @@ mod tests {
     let a = c.handle(Msg::Tick(45 * S), &e);
     assert!(a.contains(&Action::Join {
       from: 6 * S,
-      name: "c1".into()
+      name: "c1".into(),
+      rekey: false,
     }));
   }
 
@@ -661,9 +679,11 @@ mod tests {
     assert_eq!(
       a,
       [
+        // The split re-keys, so c2's video opens on the frozen picture.
         Action::Join {
           from: 14 * S,
-          name: "c1".into()
+          name: "c1".into(),
+          rekey: true,
         },
         text("c1", 614 * S, "continues in c2"),
         text("c1", 614 * S, "clip end"),
@@ -681,8 +701,58 @@ mod tests {
     assert!(c.handle(Msg::Tick(1214 * S - 1), &e).is_empty());
     assert!(c.handle(Msg::Tick(1214 * S), &e).contains(&Action::Join {
       from: 14 * S,
-      name: "c2".into()
+      name: "c2".into(),
+      rekey: true,
     }));
+  }
+
+  /// SIGTERM mid-clip: joined and ended like a close, `recording` cleared, no processing started.
+  #[test]
+  fn stop_closes_the_open_clip() {
+    let (mut c, e) = (ctl(), env());
+    shown(&mut c, &e);
+    c.handle(touch(30 * S), &e);
+    assert_eq!(
+      c.handle(Msg::Stop(33 * S), &e),
+      [
+        Action::Join {
+          from: 14 * S,
+          name: "c1".into(),
+          rekey: false,
+        },
+        text("c1", 33 * S, "clip end"),
+        Action::Recording(None),
+        Action::Log("clip /r/c1 ended".into()),
+      ]
+    );
+    assert!(ctl().handle(Msg::Stop(33 * S), &e).is_empty());
+  }
+
+  /// A static screen's segment can start hours back: the join still takes it, but the clip's name and `clip start`
+  /// count from at most `before + keyframe` back.
+  #[test]
+  fn an_hours_old_segment_doesnt_move_the_clip_start() {
+    struct Old;
+    impl Env for Old {
+      fn start_for(&self, _: Micros) -> Option<Micros> {
+        Some(0)
+      }
+      fn unique_name(&self, at: Micros) -> String {
+        format!("n{}", at / S)
+      }
+    }
+    let mut c = ctl();
+    c.handle(touch(7_200 * S), &Old);
+    assert_eq!(c.open_clip(), Some("n7183"));
+    let a = c.handle(Msg::Tick(7_215 * S), &Old);
+    assert_eq!(
+      a[0],
+      Action::Join {
+        from: 0,
+        name: "n7183".into(),
+        rekey: false,
+      }
+    );
   }
 
   #[test]
