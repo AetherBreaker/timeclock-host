@@ -3,9 +3,11 @@ pub mod capture;
 pub mod clips;
 pub mod clock;
 pub mod config;
+pub mod control;
 pub mod encode;
 pub mod freeze;
 pub mod input;
+pub mod process;
 pub mod segments;
 pub mod status;
 pub mod storage;
@@ -13,7 +15,25 @@ pub mod textlog;
 
 #[cfg(test)]
 pub(crate) mod testutil {
+  use std::sync::Once;
   use std::sync::atomic::{AtomicU32, Ordering};
+
+  unsafe extern "C" {
+    // The `libc` crate doesn't bind it.
+    fn tzset();
+  }
+
+  /// Tests share the process's zone, so every test that reads local time sets it through this, once.
+  pub fn eastern() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+      // SAFETY: runs once, before any caller reads the zone.
+      unsafe {
+        std::env::set_var("TZ", "America/New_York");
+        tzset();
+      }
+    });
+  }
 
   /// A fresh, empty directory under the system temp dir; tests remove it themselves.
   pub fn temp_dir(tag: &str) -> std::path::PathBuf {

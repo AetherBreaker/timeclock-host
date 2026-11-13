@@ -32,6 +32,35 @@ pub fn local_stamp(at: Micros) -> String {
   format!("{date} {time}.{:06}", at.rem_euclid(1_000_000))
 }
 
+/// `local_stamp`'s inverse, through `mktime`. In the repeated hour when clocks go back, it may pick the wrong one.
+pub fn parse_local_stamp(stamp: &str) -> Option<Micros> {
+  let (date, time) = stamp.split_once(' ')?;
+  let (hms, frac) = time.split_once('.')?;
+  if frac.len() != 6 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+    return None;
+  }
+  let fields: Vec<i32> = date
+    .split('-')
+    .chain(hms.split(':'))
+    .map(|p| p.parse().ok())
+    .collect::<Option<_>>()?;
+  let [year, month, day, hour, min, sec] = fields[..] else {
+    return None;
+  };
+  // SAFETY: `tm` is plain data; `mktime` reads and normalizes it in place.
+  let secs = unsafe {
+    let mut tm: libc::tm = std::mem::zeroed();
+    (tm.tm_year, tm.tm_mon, tm.tm_mday) = (year - 1900, month - 1, day);
+    (tm.tm_hour, tm.tm_min, tm.tm_sec) = (hour, min, sec);
+    tm.tm_isdst = -1; // let the zone decide
+    libc::mktime(&mut tm)
+  };
+  if secs == -1 {
+    return None;
+  }
+  Some(secs as Micros * 1_000_000 + frac.parse::<Micros>().ok()?)
+}
+
 /// A clip's base name: `2026-11-13_08-15-02`.
 pub fn clip_name(at: Micros) -> String {
   let (date, time) = local_parts(at);
@@ -62,24 +91,7 @@ pub fn unique_clip_name(dir: &Path, at: Micros) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::sync::Once;
-
-  unsafe extern "C" {
-    // The `libc` crate doesn't bind it.
-    fn tzset();
-  }
-
-  /// Tests share the process's zone, so it's set once for all of them.
-  fn eastern() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-      // SAFETY: runs once, before any test here reads the zone.
-      unsafe {
-        std::env::set_var("TZ", "America/New_York");
-        tzset();
-      }
-    });
-  }
+  use crate::testutil::eastern;
 
   const AT: Micros = 1_763_039_702_123_456;
 
@@ -87,6 +99,23 @@ mod tests {
   fn local_stamp_has_microseconds() {
     eastern();
     assert_eq!(local_stamp(AT), "2025-11-13 08:15:02.123456");
+  }
+
+  #[test]
+  fn parse_local_stamp_inverts_local_stamp() {
+    eastern();
+    assert_eq!(parse_local_stamp("2025-11-13 08:15:02.123456"), Some(AT));
+    // Summer time too.
+    let july = 1_752_000_000_000_001;
+    assert_eq!(parse_local_stamp(&local_stamp(july)), Some(july));
+    for bad in [
+      "",
+      "2025-11-13 08:15:02",
+      "2025-11-13 08:15:02.12345x",
+      "x 08:15:02.123456",
+    ] {
+      assert_eq!(parse_local_stamp(bad), None, "{bad}");
+    }
   }
 
   #[test]

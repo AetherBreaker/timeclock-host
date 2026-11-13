@@ -13,6 +13,8 @@ openh264-sys2 = { version = "0.9", default-features = false, features = ["libloa
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 timeclock-updater = { path = "../updater" }
+mp4 = "0.14"
+ab_glyph = "0.2"
 
 [profile.release]
 lto = true

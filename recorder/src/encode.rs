@@ -9,6 +9,9 @@ use openh264_sys2::API;
 
 use crate::capture::Frame;
 
+/// Fedora's OpenH264 2.6.0, on every clock.
+pub const OPENH264: &str = "/usr/lib64/libopenh264.so.8";
+
 /// Fixed quantizer: text stays readable at a modest size. Task 9 tunes it on the device.
 const QP: u8 = 26;
 
@@ -136,7 +139,7 @@ impl H264Decoder {
 mod tests {
   use super::*;
 
-  const LIB: &str = "/usr/lib64/libopenh264.so.8";
+  const LIB: &str = OPENH264;
 
   /// Left half `#161514` (the page background), right half white, so the decoded picture is checkable despite loss.
   fn frame(width: u32, height: u32) -> Frame {
