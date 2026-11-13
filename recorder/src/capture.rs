@@ -42,6 +42,8 @@ type Layout = (wl_shm::Format, u32, u32, u32);
 struct State {
   /// First supported shm layout offered for the current frame.
   offered: Option<Layout>,
+  /// Every shm format offered, as raw `wl_shm` numbers, so an unusable set names itself in the error.
+  formats: Vec<u32>,
   buffer_done: bool,
   y_invert: bool,
   /// `ready`'s CLOCK_MONOTONIC presentation time, in µs.
@@ -78,14 +80,23 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
   ) {
     use zwlr_screencopy_frame_v1::Event;
     match event {
-      // XRGB8888/ARGB8888 are little-endian, so B, G, R, X in memory: the frame's own layout.
+      // The 32-bit formats `copy_out` turns into BGRx. Sway 1.11 on Intel offers only XBGR8888.
       Event::Buffer {
-        format: WEnum::Value(format @ (wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888)),
+        format,
         width,
         height,
         stride,
-      } if state.offered.is_none() => {
-        state.offered = Some((format, width, height, stride));
+      } => {
+        use wl_shm::Format::{Abgr8888, Argb8888, Xbgr8888, Xrgb8888};
+        state.formats.push(match format {
+          WEnum::Value(f) => f.into(),
+          WEnum::Unknown(raw) => raw,
+        });
+        if let WEnum::Value(f @ (Xrgb8888 | Argb8888 | Xbgr8888 | Abgr8888)) = format
+          && state.offered.is_none()
+        {
+          state.offered = Some((f, width, height, stride));
+        }
       }
       Event::BufferDone => state.buffer_done = true,
       Event::Flags { flags } => {
@@ -171,10 +182,12 @@ impl Capture {
         .blocking_dispatch(&mut self.state)
         .map_err(io::Error::other)?;
     }
-    let layout @ (format, width, height, stride) = self
-      .state
-      .offered
-      .ok_or_else(|| io::Error::other("the compositor offered no XRGB8888/ARGB8888 shm buffer"))?;
+    let layout @ (format, width, height, stride) = self.state.offered.ok_or_else(|| {
+      io::Error::other(format!(
+        "the compositor offered no XRGB/ARGB/XBGR/ABGR8888 shm buffer; offered wl_shm formats: {:?}",
+        self.state.formats
+      ))
+    })?;
     if self.buffer.as_ref().is_none_or(|b| b.layout != layout) {
       if let Some(old) = self.buffer.take() {
         old.buffer.destroy();
@@ -237,19 +250,31 @@ impl Capture {
     let first = if self.state.y_invert { height - y1 } else { y0 };
     let mut band = vec![0; (h * stride) as usize];
     shm.file.read_exact_at(&mut band, u64::from(first * stride))?;
-    let mut bgrx = Vec::with_capacity((w * h * 4) as usize);
-    for i in 0..h {
-      let row = if self.state.y_invert { h - 1 - i } else { i };
-      let start = (row * stride + x0 * 4) as usize;
-      bgrx.extend_from_slice(&band[start..start + (w * 4) as usize]);
-    }
     Ok(Frame {
       at,
       width: w,
       height: h,
-      bgrx,
+      bgrx: copy_out(&band, format, stride, x0, (w, h), self.state.y_invert),
     })
   }
+}
+
+/// The `w`x`h` pixels at column `x0` of `band` (rows `stride` bytes apart, bottom-up if `y_invert`), tightly packed
+/// as B, G, R, X.
+fn copy_out(band: &[u8], format: wl_shm::Format, stride: u32, x0: u32, (w, h): (u32, u32), y_invert: bool) -> Vec<u8> {
+  let mut bgrx = Vec::with_capacity((w * h * 4) as usize);
+  for i in 0..h {
+    let row = if y_invert { h - 1 - i } else { i };
+    let start = (row * stride + x0 * 4) as usize;
+    bgrx.extend_from_slice(&band[start..start + (w * 4) as usize]);
+  }
+  // XBGR8888/ABGR8888 are R, G, B, X in memory.
+  if matches!(format, wl_shm::Format::Xbgr8888 | wl_shm::Format::Abgr8888) {
+    for px in bgrx.as_chunks_mut::<4>().0 {
+      px.swap(0, 2);
+    }
+  }
+  bgrx
 }
 
 #[cfg(test)]
@@ -268,5 +293,51 @@ mod tests {
       bgrx,
     };
     assert_eq!(beat(&frame), 0x171615);
+  }
+
+  /// Two rows of four pixels (stride 16), each pixel distinct; `rgb_order` stores them R, G, B, X.
+  fn band(rgb_order: bool) -> Vec<u8> {
+    let mut band = Vec::new();
+    for y in 0..2u8 {
+      for x in 0..4u8 {
+        let (b, g, r) = (x, y, 0x80 + x);
+        band.extend_from_slice(&if rgb_order { [r, g, b, 0xff] } else { [b, g, r, 0xff] });
+      }
+    }
+    band
+  }
+
+  #[test]
+  fn copy_out_crops_and_keeps_bgrx() {
+    let out = copy_out(&band(false), wl_shm::Format::Xrgb8888, 16, 1, (2, 2), false);
+    assert_eq!(
+      out,
+      band(false)[4..12]
+        .iter()
+        .chain(&band(false)[20..28])
+        .copied()
+        .collect::<Vec<_>>()
+    );
+  }
+
+  #[test]
+  fn copy_out_swaps_xbgr_into_bgrx() {
+    for format in [wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888] {
+      let out = copy_out(&band(true), format, 16, 1, (2, 2), false);
+      assert_eq!(
+        out,
+        band(false)[4..12]
+          .iter()
+          .chain(&band(false)[20..28])
+          .copied()
+          .collect::<Vec<_>>()
+      );
+    }
+  }
+
+  #[test]
+  fn copy_out_flips_a_bottom_up_buffer() {
+    let out = copy_out(&band(false), wl_shm::Format::Argb8888, 16, 0, (1, 2), true);
+    assert_eq!(out, [band(false)[16..20].to_vec(), band(false)[0..4].to_vec()].concat());
   }
 }
