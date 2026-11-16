@@ -7,6 +7,9 @@ After=timeclock-display.service
 
 [Service]
 Type=simple
+# The display unit starts before sway's sockets exist; without this wait the recorder's first start at every boot
+# failed with ENOENT. Sway answers on its control socket only after it has made the Wayland one.
+ExecStartPre=/bin/sh -c 'until swaymsg -s /run/timeclock-display/sway.sock -t get_version >/dev/null 2>&1; do sleep 0.2; done'
 ExecStart=/usr/bin/timeclock-recorder
 Restart=always
 RestartSec=5
